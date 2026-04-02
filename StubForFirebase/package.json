@@ -1,0 +1,12 @@
+{
+  "name": "iot-mock-publisher",
+  "version": "1.0.0",
+  "description": "Stub publisher for IoT data to Firebase",
+  "main": "stub-publisher.js",
+  "scripts": {
+    "start": "node mock-publisher.js"
+  },
+  "dependencies": {
+    "firebase": "^10.7.1"
+  }
+}

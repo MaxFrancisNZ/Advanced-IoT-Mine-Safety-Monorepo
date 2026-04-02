@@ -8,3 +8,4 @@ We'll manage the monorepository into the following subcomponent codebases
   - [ ] BasestationToFirebaseIntegrator
 - [ ] ESPWearableTransceiver
 - [x] node-data-schema.json
+- [x] StubForFirebase
