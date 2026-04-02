@@ -1,0 +1,72 @@
+{
+  "$schema": "http://json-schema.org/draft-07/schema#",
+  "title": "IoT Data Packet",
+  "type": "object",
+  "required": [
+    "node_id",
+    "transmission_attempts",
+    "environment",
+    "led_state"
+  ],
+  "properties": {
+    "node_id": {
+      "type": "string",
+      "description": "Unique node identifier (e.g., MAC address)",
+      "pattern": "^([0-9A-Fa-f]{2}:){5}[0-9A-Fa-f]{2}$"
+    },
+    "transmission_attempts": {
+      "type": "integer",
+      "description": "Number of times the packet transmission has been attempted",
+      "minimum": 0
+    },
+    "environment": {
+      "type": "object",
+      "required": [
+        "temperature",
+        "humidity",
+        "accelerometer",
+        "gyroscope",
+        "barometric_pressure"
+      ],
+      "properties": {
+        "temperature": {
+          "type": "number",
+          "description": "Temperature in Celsius"
+        },
+        "humidity": {
+          "type": "number",
+          "description": "Relative humidity percentage",
+          "minimum": 0,
+          "maximum": 100
+        },
+        "accelerometer": {
+          "type": "object",
+          "required": ["x", "y", "z"],
+          "properties": {
+            "x": { "type": "number" },
+            "y": { "type": "number" },
+            "z": { "type": "number" }
+          }
+        },
+        "gyroscope": {
+          "type": "object",
+          "required": ["x", "y", "z"],
+          "properties": {
+            "x": { "type": "number" },
+            "y": { "type": "number" },
+            "z": { "type": "number" }
+          }
+        },
+        "barometric_pressure": {
+          "type": "number",
+          "description": "Pressure in hPa"
+        }
+      }
+    },
+    "led_state": {
+      "type": "string",
+      "description": "LED RGB color in hexadecimal format",
+      "pattern": "^#?[0-9A-Fa-f]{6}$"
+    }
+  }
+}
