@@ -2,12 +2,7 @@
   "$schema": "http://json-schema.org/draft-07/schema#",
   "title": "IoT Data Packet",
   "type": "object",
-  "required": [
-    "node_id",
-    "transmission_attempts",
-    "environment",
-    "led_state"
-  ],
+  "required": ["node_id", "transmission_attempts", "environment", "battery_voltage", "led_state"],
   "properties": {
     "node_id": {
       "type": "string",
@@ -62,6 +57,10 @@
           "description": "Pressure in hPa"
         }
       }
+    },
+    "battery_voltage": {
+      "type": ["number", "null"],
+      "description": "Battery voltage in volts"
     },
     "led_state": {
       "type": "string",

@@ -13,6 +13,7 @@
 #include "espnow_manager.h"
 #include "led_manager.h"
 #include "dht_manager.h"
+#include "battery_probe.h"
 
 /* Hardware configuration */
 #define I2C_SDA_GPIO 21
@@ -21,6 +22,7 @@
 #define I2C_FREQ_HZ 100000
 #define ESPNOW_CHANNEL 1
 #define LED_GPIO GPIO_NUM_16
+#define BATTERY_SENSE_GPIO GPIO_NUM_35
 #define MPU6050_ADDR 0x68
 #define BMP180_ADDR 0x77
 #define BMP180_OSS 0
@@ -38,6 +40,9 @@ static i2c_master_dev_handle_t bmp180_dev = NULL;
 static i2c_manager_bmp180_calibration_t bmp180_calibration = {0};
 static char node_id[18] = {0};
 static bool dht_ready = false;
+static bool battery_probe_ready = false;
+static battery_probe_reading_t last_battery_reading = {0};
+static bool battery_reading_valid = false;
 
 
 /* Forward declarations */
@@ -46,6 +51,8 @@ static void log_sensor_error(const char *sensor_name, esp_err_t err);
 static void format_optional_float(char *buffer, size_t buffer_len, bool has_value, float value, uint8_t decimals);
 static void format_payload(char *json, size_t json_len, uint32_t transmission_attempts);
 static void initialize_sensors(void);
+static void log_battery_probe(void);
+static void refresh_battery_probe(void);
 
 static void log_sensor_error(const char *sensor_name, esp_err_t err)
 {
@@ -81,6 +88,45 @@ static void initialize_sensors(void)
     }
 }
 
+static void refresh_battery_probe(void)
+{
+    if (!battery_probe_ready) {
+        battery_reading_valid = false;
+        return;
+    }
+
+    esp_err_t err = battery_probe_read(&last_battery_reading);
+    if (err != ESP_OK) {
+        battery_reading_valid = false;
+        ESP_LOGW(TAG, "Battery probe unavailable: %s", esp_err_to_name(err));
+        return;
+    }
+
+    battery_reading_valid = last_battery_reading.calibrated;
+}
+
+static void log_battery_probe(void)
+{
+    if (!battery_probe_ready) {
+        return;
+    }
+
+    refresh_battery_probe();
+    if (!battery_reading_valid) {
+        ESP_LOGI(TAG, "GPIO35 battery probe: raw=%d battery_voltage=uncalibrated", last_battery_reading.raw);
+        return;
+    }
+
+    if (last_battery_reading.calibrated) {
+        ESP_LOGI(TAG,
+                 "GPIO35 battery probe: raw=%d pin_voltage=%dmV battery_voltage=%.3fV heuristic=%s",
+                 last_battery_reading.raw,
+                 last_battery_reading.pin_millivolts,
+                 last_battery_reading.battery_voltage,
+                 last_battery_reading.pin_millivolts > 1500 ? "divider_or_battery_present" : "likely_not_divided_or_not_connected");
+    }
+}
+
 static void format_payload(char *json, size_t json_len, uint32_t transmission_attempts)
 {
     i2c_manager_mpu6050_data_t mpu_data = {0};
@@ -105,8 +151,10 @@ static void format_payload(char *json, size_t json_len, uint32_t transmission_at
     char gyro_y[16];
     char gyro_z[16];
     char pressure[16];
+    char battery_voltage[16];
 
     initialize_sensors();
+    refresh_battery_probe();
 
     if (dht_ready) {
         dht_err = dht_manager_read(&dht_data);
@@ -150,12 +198,14 @@ static void format_payload(char *json, size_t json_len, uint32_t transmission_at
     format_optional_float(gyro_y, sizeof(gyro_y), has_gyro, (float)mpu_data.gyro_y / 131.0f, 3);
     format_optional_float(gyro_z, sizeof(gyro_z), has_gyro, (float)mpu_data.gyro_z / 131.0f, 3);
     format_optional_float(pressure, sizeof(pressure), has_pressure, (float)bmp_data.pressure_pa / 100.0f, 2);
+    format_optional_float(battery_voltage, sizeof(battery_voltage), battery_reading_valid, last_battery_reading.battery_voltage, 3);
 
     snprintf(json, json_len,
              "{"
              "\"node_id\":\"%s\","
              "\"transmission_attempts\":%" PRIu32 ","
              "\"environment\":{"
+             "\"battery_voltage\":%s,"
              "\"temperature\":%s,"
              "\"humidity\":%s,"
              "\"accelerometer\":{\"x\":%s,\"y\":%s,\"z\":%s},"
@@ -166,6 +216,7 @@ static void format_payload(char *json, size_t json_len, uint32_t transmission_at
              "}",
              node_id,
              transmission_attempts,
+             battery_voltage,
              temperature,
              humidity,
              accel_x,
@@ -188,6 +239,7 @@ static void send_task(void *pvParameters)
 
     while (1)
     {
+        log_battery_probe();
         format_payload(json, sizeof(json), failed_transmission_attempts);
 
         bool delivered = false;
@@ -231,6 +283,14 @@ void app_main(void)
     };
 
     ESP_ERROR_CHECK(led_manager_init(LED_GPIO, true));
+    esp_err_t battery_err = battery_probe_init(BATTERY_SENSE_GPIO);
+    if (battery_err != ESP_OK) {
+        ESP_LOGW(TAG, "Battery probe init failed on GPIO35: %s", esp_err_to_name(battery_err));
+    } else {
+        battery_probe_ready = true;
+        log_battery_probe();
+    }
+
     esp_err_t dht_err = dht_manager_init(HUMITURE_GPIO, HUMITURE_TYPE);
     if (dht_err != ESP_OK) {
         log_sensor_error("DHT", dht_err);
