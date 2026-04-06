@@ -1,0 +1,194 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>IoT Mine Safety Dashboard</title>
+    <script src="https://www.gstatic.com/firebasejs/10.7.1/firebase-app-compat.js"></script>
+    <script src="https://www.gstatic.com/firebasejs/10.7.1/firebase-firestore-compat.js"></script>
+    <script src="https://cdn.jsdelivr.net/npm/chart.js"></script>
+    <style>
+        body { font-family: Arial, sans-serif; margin: 20px; }
+        .container { max-width: 1200px; margin: 0 auto; }
+        .chart-container { margin: 20px 0; }
+        table { width: 100%; border-collapse: collapse; margin-top: 20px; }
+        th, td { border: 1px solid #ddd; padding: 8px; text-align: left; }
+        th { background-color: #f2f2f2; }
+    </style>
+</head>
+<body>
+    <div class="container">
+        <h1>IoT Mine Safety Dashboard</h1>
+        <p>Real-time data from Firestore</p>
+        <div id="statusMessage" style="margin-bottom: 16px; color: #555;">Connecting...</div>
+
+        <div class="chart-container">
+            <canvas id="temperatureChart"></canvas>
+        </div>
+
+        <div class="chart-container">
+            <canvas id="humidityChart"></canvas>
+        </div>
+
+        <h2>Recent Data</h2>
+        <table id="dataTable">
+            <thead>
+                <tr>
+                    <th>Node ID</th>
+                    <th>Temperature (°C)</th>
+                    <th>Humidity (%)</th>
+                    <th>Barometric Pressure (hPa)</th>
+                    <th>Battery Voltage (V)</th>
+                    <th>Received At</th>
+                </tr>
+            </thead>
+            <tbody id="dataBody">
+                <tr><td colspan="6">Loading...</td></tr>
+            </tbody>
+        </table>
+    </div>
+
+    <script>
+        // Firebase configuration - REPLACE WITH YOURS
+        const firebaseConfig = {
+            apiKey: "AIzaSyAcZmW8CGW3eM4qQs2LR6ru5VDE1693oig",
+            authDomain: "iot-mine-safety.firebaseapp.com",
+            projectId: "iot-mine-safety",
+            storageBucket: "iot-mine-safety.firebasestorage.app",
+            messagingSenderId: "335965054917",
+            appId: "1:335965054917:web:19b4fb2d7c2d9dc9ba4dac"
+        };
+
+        // Initialize Firebase
+        firebase.initializeApp(firebaseConfig);
+        const db = firebase.firestore();
+
+        let temperatureChart, humidityChart;
+
+        function initCharts() {
+            const ctxTemp = document.getElementById('temperatureChart').getContext('2d');
+            temperatureChart = new Chart(ctxTemp, {
+                type: 'line',
+                data: {
+                    labels: [],
+                    datasets: [{
+                        label: 'Temperature (°C)',
+                        data: [],
+                        borderColor: 'rgb(255, 99, 132)',
+                        tension: 0.1
+                    }]
+                },
+                options: {
+                    responsive: true,
+                    scales: {
+                        x: { display: true, title: { display: true, text: 'Time' } },
+                        y: { display: true, title: { display: true, text: 'Temperature (°C)' } }
+                    }
+                }
+            });
+
+            const ctxHum = document.getElementById('humidityChart').getContext('2d');
+            humidityChart = new Chart(ctxHum, {
+                type: 'line',
+                data: {
+                    labels: [],
+                    datasets: [{
+                        label: 'Humidity (%)',
+                        data: [],
+                        borderColor: 'rgb(54, 162, 235)',
+                        tension: 0.1
+                    }]
+                },
+                options: {
+                    responsive: true,
+                    scales: {
+                        x: { display: true, title: { display: true, text: 'Time' } },
+                        y: { display: true, title: { display: true, text: 'Humidity (%)' } }
+                    }
+                }
+            });
+        }
+
+        function setStatus(message) {
+            const status = document.getElementById('statusMessage');
+            status.textContent = message;
+        }
+
+        function updateTable(data) {
+            const tbody = document.getElementById('dataBody');
+            tbody.innerHTML = '';
+
+            if (data.length === 0) {
+                tbody.innerHTML = '<tr><td colspan="6">No data available yet.</td></tr>';
+                return;
+            }
+
+            data.forEach(doc => {
+                const row = document.createElement('tr');
+                const d = doc.data();
+                row.innerHTML = `
+                    <td>${d.node_id || 'N/A'}</td>
+                    <td>${d.environment?.temperature ?? 'N/A'}</td>
+                    <td>${d.environment?.humidity ?? 'N/A'}</td>
+                    <td>${d.environment?.barometric_pressure ?? 'N/A'}</td>
+                    <td>${d.battery_voltage ?? 'N/A'}</td>
+                    <td>${d.received_at?.toDate?.toLocaleString() || 'N/A'}</td>
+                `;
+                tbody.appendChild(row);
+            });
+        }
+
+        function updateCharts(data) {
+            if (data.length === 0) {
+                temperatureChart.data.labels = [];
+                temperatureChart.data.datasets[0].data = [];
+                humidityChart.data.labels = [];
+                humidityChart.data.datasets[0].data = [];
+                temperatureChart.update();
+                humidityChart.update();
+                return;
+            }
+
+            const sorted = data.slice().sort((a, b) => {
+                const aTime = a.data().received_at?.toDate()?.getTime() || 0;
+                const bTime = b.data().received_at?.toDate()?.getTime() || 0;
+                return bTime - aTime;
+            });
+
+            const labels = sorted.map(doc => doc.data().received_at?.toDate()?.toLocaleTimeString() || 'Unknown');
+            const temps = sorted.map(doc => doc.data().environment?.temperature ?? 0);
+            const hums = sorted.map(doc => doc.data().environment?.humidity ?? 0);
+
+            temperatureChart.data.labels = labels;
+            temperatureChart.data.datasets[0].data = temps;
+            temperatureChart.update();
+
+            humidityChart.data.labels = labels;
+            humidityChart.data.datasets[0].data = hums;
+            humidityChart.update();
+        }
+
+        function loadData() {
+            db.collection('iot-data')
+                .limit(50)
+                .onSnapshot((querySnapshot) => {
+                    setStatus(`Loaded ${querySnapshot.size} document(s)`);
+                    const data = [];
+                    querySnapshot.forEach((doc) => {
+                        data.push(doc);
+                    });
+                    updateTable(data);
+                    updateCharts(data);
+                }, (error) => {
+                    console.error('Error loading data:', error);
+                    setStatus('Failed to load data. Check console.');
+                    document.getElementById('dataBody').innerHTML = '<tr><td colspan="6">Error loading data. Check console.</td></tr>';
+                });
+        }
+
+        // Initialize
+        initCharts();
+        loadData();
+    </script>
+</body>
+</html>
