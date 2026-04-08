@@ -1,0 +1,4 @@
+firebase-admin
+pyserial
+jsonschema
+python-dotenv

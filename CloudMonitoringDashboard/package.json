@@ -1,0 +1,12 @@
+{
+  "name": "iot-dashboard",
+  "version": "1.0.0",
+  "description": "Simple dashboard to visualize IoT data from Firestore",
+  "main": "index.html",
+  "scripts": {
+    "start": "npx http-server . -p 3000"
+  },
+  "dependencies": {
+    "firebase": "^12.11.0"
+  }
+}
