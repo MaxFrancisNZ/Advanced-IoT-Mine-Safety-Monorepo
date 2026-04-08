@@ -14,6 +14,9 @@
 #include "led_manager.h"
 #include "dht_manager.h"
 #include "battery_probe.h"
+#include "mic_manager.h"
+#include "adpcm.h"
+#include "audio_protocol.h"
 
 /* Hardware configuration */
 #define I2C_SDA_GPIO 21
@@ -30,6 +33,16 @@
 #define HUMITURE_GPIO GPIO_NUM_4
 #define HUMITURE_TYPE DHT_MANAGER_TYPE_DHT11
 
+#define MIC_I2S_BCK_GPIO  GPIO_NUM_26
+#define MIC_I2S_WS_GPIO   GPIO_NUM_25
+#define MIC_I2S_DIN_GPIO  GPIO_NUM_33
+#define BUTTON_GPIO       GPIO_NUM_14
+
+#define AUDIO_SAMPLE_RATE    8000
+#define AUDIO_MAX_SECONDS    5
+#define AUDIO_MAX_SAMPLES    (AUDIO_SAMPLE_RATE * AUDIO_MAX_SECONDS)
+#define MIC_READ_CHUNK       512
+
 /* Application configuration */
 static const char *TAG = "ESPNOW_TX";
 
@@ -43,16 +56,19 @@ static bool dht_ready = false;
 static bool battery_probe_ready = false;
 static battery_probe_reading_t last_battery_reading = {0};
 static bool battery_reading_valid = false;
+static volatile bool audio_active = false;
 
 
 /* Forward declarations */
 static void send_task(void *pvParameters);
+static void button_task(void *pvParameters);
 static void log_sensor_error(const char *sensor_name, esp_err_t err);
 static void format_optional_float(char *buffer, size_t buffer_len, bool has_value, float value, uint8_t decimals);
 static void format_payload(char *json, size_t json_len, uint32_t transmission_attempts);
 static void initialize_sensors(void);
 static void log_battery_probe(void);
 static void refresh_battery_probe(void);
+static void send_audio_chunks(const uint8_t *adpcm_data, size_t adpcm_len, uint32_t total_samples);
 
 static void log_sensor_error(const char *sensor_name, esp_err_t err)
 {
@@ -229,6 +245,128 @@ static void format_payload(char *json, size_t json_len, uint32_t transmission_at
              led_manager_is_on() ? "#00FF00" : "#000000");
 }
 
+/* Send ADPCM audio as chunked ESP-NOW packets */
+static void send_audio_chunks(const uint8_t *adpcm_data, size_t adpcm_len, uint32_t total_samples)
+{
+    uint8_t wifi_mac[6];
+    esp_read_mac(wifi_mac, ESP_MAC_WIFI_STA);
+
+    uint16_t total_chunks = (uint16_t)((adpcm_len + AUDIO_CHUNK_DATA_MAX - 1) / AUDIO_CHUNK_DATA_MAX);
+
+    ESP_LOGI(TAG, "Sending audio: %zu bytes ADPCM, %"PRIu32" samples, %u chunks",
+             adpcm_len, total_samples, total_chunks);
+
+    for (uint16_t i = 0; i < total_chunks; i++) {
+        uint8_t pkt[ESPNOW_MAX_PAYLOAD];
+        audio_chunk_header_t *hdr = (audio_chunk_header_t *)pkt;
+
+        hdr->msg_type      = AUDIO_MSG_TYPE;
+        memcpy(hdr->node_mac, wifi_mac, 6);
+        hdr->seq_num       = i;
+        hdr->total_chunks  = total_chunks;
+        hdr->sample_rate   = AUDIO_SAMPLE_RATE;
+        hdr->total_samples = total_samples;
+
+        size_t offset    = (size_t)i * AUDIO_CHUNK_DATA_MAX;
+        size_t chunk_len = adpcm_len - offset;
+        if (chunk_len > AUDIO_CHUNK_DATA_MAX) chunk_len = AUDIO_CHUNK_DATA_MAX;
+        hdr->data_len = (uint16_t)chunk_len;
+
+        memcpy(pkt + AUDIO_CHUNK_HDR_SIZE, adpcm_data + offset, chunk_len);
+
+        size_t pkt_len = AUDIO_CHUNK_HDR_SIZE + chunk_len;
+        bool delivered = false;
+        esp_err_t err = espnow_manager_send_and_wait(pkt, pkt_len, 200, &delivered);
+        if (err != ESP_OK || !delivered) {
+            ESP_LOGW(TAG, "Audio chunk %u/%u failed", i + 1, total_chunks);
+        }
+
+        vTaskDelay(pdMS_TO_TICKS(5));
+    }
+
+    ESP_LOGI(TAG, "Audio transmission complete");
+}
+
+/* Push-to-talk button task */
+static void button_task(void *pvParameters)
+{
+    (void)pvParameters;
+
+    gpio_set_direction(BUTTON_GPIO, GPIO_MODE_INPUT);
+    gpio_set_pull_mode(BUTTON_GPIO, GPIO_PULLUP_ONLY);
+
+    int16_t read_buf[MIC_READ_CHUNK];
+
+    while (1) {
+        /* Wait for button press (active-low) */
+        if (gpio_get_level(BUTTON_GPIO) != 0) {
+            vTaskDelay(pdMS_TO_TICKS(50));
+            continue;
+        }
+
+        /* Debounce */
+        vTaskDelay(pdMS_TO_TICKS(50));
+        if (gpio_get_level(BUTTON_GPIO) != 0) continue;
+
+        /* --- Begin recording --- */
+        audio_active = true;
+        ESP_LOGI(TAG, "Recording started (hold button, max %d sec)", AUDIO_MAX_SECONDS);
+
+        size_t adpcm_buf_size = (AUDIO_MAX_SAMPLES + 1) / 2;
+        uint8_t *adpcm_buf = malloc(adpcm_buf_size);
+        if (adpcm_buf == NULL) {
+            ESP_LOGE(TAG, "Failed to allocate ADPCM buffer (%zu bytes)", adpcm_buf_size);
+            audio_active = false;
+            continue;
+        }
+
+        adpcm_state_t adpcm_state = {0, 0};
+        size_t adpcm_offset = 0;
+        size_t total_samples = 0;
+
+        esp_err_t err = mic_manager_start();
+        if (err != ESP_OK) {
+            ESP_LOGE(TAG, "mic_manager_start failed: %s", esp_err_to_name(err));
+            free(adpcm_buf);
+            audio_active = false;
+            continue;
+        }
+
+        /* Record while button is held, up to max duration */
+        while (gpio_get_level(BUTTON_GPIO) == 0 && total_samples < AUDIO_MAX_SAMPLES) {
+            size_t remaining = AUDIO_MAX_SAMPLES - total_samples;
+            size_t to_read = remaining < MIC_READ_CHUNK ? remaining : MIC_READ_CHUNK;
+            size_t samples_read = 0;
+
+            err = mic_manager_read(read_buf, to_read, &samples_read, 500);
+            if (err != ESP_OK || samples_read == 0) continue;
+
+            size_t encoded = adpcm_encode(read_buf, samples_read,
+                                          adpcm_buf + adpcm_offset, &adpcm_state);
+            adpcm_offset += encoded;
+            total_samples += samples_read;
+        }
+
+        mic_manager_stop();
+
+        ESP_LOGI(TAG, "Recording stopped: %zu samples (%.1f sec)",
+                 total_samples, (float)total_samples / AUDIO_SAMPLE_RATE);
+
+        /* --- Send compressed audio --- */
+        if (total_samples > 0) {
+            send_audio_chunks(adpcm_buf, adpcm_offset, (uint32_t)total_samples);
+        }
+
+        free(adpcm_buf);
+        audio_active = false;
+
+        /* Wait for button release before allowing another recording */
+        while (gpio_get_level(BUTTON_GPIO) == 0) {
+            vTaskDelay(pdMS_TO_TICKS(50));
+        }
+    }
+}
+
 /* Periodic transmit task */
 static void send_task(void *pvParameters)
 {
@@ -239,6 +377,11 @@ static void send_task(void *pvParameters)
 
     while (1)
     {
+        if (audio_active) {
+            vTaskDelay(pdMS_TO_TICKS(500));
+            continue;
+        }
+
         log_battery_probe();
         format_payload(json, sizeof(json), failed_transmission_attempts);
 
@@ -317,7 +460,20 @@ void app_main(void)
              wifi_sta_mac[0], wifi_sta_mac[1], wifi_sta_mac[2],
              wifi_sta_mac[3], wifi_sta_mac[4], wifi_sta_mac[5]);
 
+    /* Initialise MEMS microphone (I2S) */
+    const mic_manager_config_t mic_config = {
+        .bck_gpio    = MIC_I2S_BCK_GPIO,
+        .ws_gpio     = MIC_I2S_WS_GPIO,
+        .din_gpio    = MIC_I2S_DIN_GPIO,
+        .sample_rate = AUDIO_SAMPLE_RATE,
+    };
+    esp_err_t mic_err = mic_manager_init(&mic_config);
+    if (mic_err != ESP_OK) {
+        ESP_LOGE(TAG, "Microphone init failed: %s", esp_err_to_name(mic_err));
+    }
+
     xTaskCreate(send_task, "send_task", 4096, NULL, 4, NULL);
+    xTaskCreate(button_task, "button_task", 8192, NULL, 5, NULL);
 
     ESP_LOGI(TAG, "Transmitter ready");
 }

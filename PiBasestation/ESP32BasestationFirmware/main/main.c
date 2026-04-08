@@ -16,13 +16,13 @@
 #include "esp_mac.h"
 
 #define ESPNOW_CHANNEL 1
-#define MAX_JSON_LEN   512
+#define MAX_JSON_LEN   ESP_NOW_MAX_DATA_LEN_V2
 
 #define UART_BRIDGE_PORT      UART_NUM_1
 #define UART_BRIDGE_TX_PIN    17
 #define UART_BRIDGE_RX_PIN    16
 #define UART_BRIDGE_BAUD_RATE 115200
-#define UART_RX_BUF_SIZE      512
+#define UART_RX_BUF_SIZE      ESP_NOW_MAX_DATA_LEN_V2
 
 static const uint8_t ESPNOW_BROADCAST_ADDR[ESP_NOW_ETH_ALEN] = {
     0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF
