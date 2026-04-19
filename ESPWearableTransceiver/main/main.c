@@ -17,10 +17,11 @@
 #include "mic_manager.h"
 #include "adpcm.h"
 #include "audio_protocol.h"
+#include "ws2812_manager.h"
 
 /* Hardware configuration */
-#define I2C_SDA_GPIO 21
-#define I2C_SCL_GPIO 22
+#define I2C_SDA_GPIO 18
+#define I2C_SCL_GPIO 5
 #define I2C_PORT_NUM I2C_NUM_0
 #define I2C_FREQ_HZ 100000
 #define ESPNOW_CHANNEL 1
@@ -33,10 +34,11 @@
 #define HUMITURE_GPIO GPIO_NUM_4
 #define HUMITURE_TYPE DHT_MANAGER_TYPE_DHT11
 
-#define MIC_I2S_BCK_GPIO  GPIO_NUM_26
-#define MIC_I2S_WS_GPIO   GPIO_NUM_25
-#define MIC_I2S_DIN_GPIO  GPIO_NUM_33
+#define MIC_I2S_BCK_GPIO  GPIO_NUM_33
+#define MIC_I2S_WS_GPIO   GPIO_NUM_26
+#define MIC_I2S_DIN_GPIO  GPIO_NUM_25
 #define BUTTON_GPIO       GPIO_NUM_14
+#define WS2812_GPIO       GPIO_NUM_12
 
 #define AUDIO_SAMPLE_RATE    8000
 #define AUDIO_MAX_SECONDS    5
@@ -474,6 +476,14 @@ void app_main(void)
 
     xTaskCreate(send_task, "send_task", 4096, NULL, 4, NULL);
     xTaskCreate(button_task, "button_task", 8192, NULL, 5, NULL);
+
+    /* WS2812 status LED – green on boot */
+    esp_err_t ws_err = ws2812_manager_init(WS2812_GPIO);
+    if (ws_err != ESP_OK) {
+        ESP_LOGW(TAG, "WS2812 init failed: %s", esp_err_to_name(ws_err));
+    } else {
+        ws2812_manager_set_color(0, 30, 0);
+    }
 
     ESP_LOGI(TAG, "Transmitter ready");
 }

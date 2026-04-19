@@ -3,7 +3,7 @@
     {
       "name": "ESP-IDF",
       "compilerPath": "C:\\Users\\Josh\\.espressif\\tools\\xtensa-esp-elf\\esp-14.2.0_20241119\\xtensa-esp-elf\\bin\\xtensa-esp32-elf-gcc.exe",
-      "compileCommands": "${config:idf.buildPath}/compile_commands.json",
+      "compileCommands": "c:\\Users\\Josh\\Desktop\\uni proj iot\\Advanced-IoT-Mine-Safety-Monorepo\\ESPWearableTransceiver\\build\\compile_commands.json",
       "includePath": [
         "${workspaceFolder}/**"
       ],

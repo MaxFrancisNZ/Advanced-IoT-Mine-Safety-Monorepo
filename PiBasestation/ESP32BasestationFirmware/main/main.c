@@ -160,13 +160,16 @@ static void uart_to_espnow_task(void *pvParameters)
                 continue;
             }
 
-            esp_err_t err = esp_now_send(ESPNOW_BROADCAST_ADDR, (const uint8_t *)line_buf, line_len);
-            if (err != ESP_OK) {
-                ESP_LOGE(TAG, "ESP-NOW send failed: %s", esp_err_to_name(err));
-            } else {
-                line_buf[line_len] = '\0';
-                ESP_LOGI(TAG, "Sent %u UART bytes over ESP-NOW: %s", (unsigned)line_len, line_buf);
-            }
+            // TODO: Re-enable UART->ESP-NOW forwarding when ready
+            // esp_err_t err = esp_now_send(ESPNOW_BROADCAST_ADDR, (const uint8_t *)line_buf, line_len);
+            // if (err != ESP_OK) {
+            //     ESP_LOGE(TAG, "ESP-NOW send failed: %s", esp_err_to_name(err));
+            // } else {
+            //     line_buf[line_len] = '\0';
+            //     ESP_LOGI(TAG, "Sent %u UART bytes over ESP-NOW: %s", (unsigned)line_len, line_buf);
+            // }
+            line_buf[line_len] = '\0';
+            ESP_LOGW(TAG, "UART->ESP-NOW disabled, dropped %u bytes: %s", (unsigned)line_len, line_buf);
 
             line_len = 0;
             continue;

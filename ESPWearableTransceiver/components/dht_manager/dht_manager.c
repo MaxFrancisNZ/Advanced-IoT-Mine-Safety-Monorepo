@@ -14,6 +14,35 @@ static const char *TAG = "DHT_MANAGER";
 static gpio_num_t s_dht_gpio = GPIO_NUM_NC;
 static dht_manager_type_t s_dht_type = DHT_MANAGER_TYPE_DHT11;
 
+static esp_err_t validate_reading(const dht_manager_data_t *data)
+{
+    if (data == NULL) {
+        return ESP_ERR_INVALID_ARG;
+    }
+
+    if (s_dht_type == DHT_MANAGER_TYPE_DHT11) {
+        if (data->humidity_percent < 20.0f || data->humidity_percent > 90.0f) {
+            return ESP_ERR_INVALID_RESPONSE;
+        }
+
+        if (data->temperature_c < 0.0f || data->temperature_c > 50.0f) {
+            return ESP_ERR_INVALID_RESPONSE;
+        }
+
+        return ESP_OK;
+    }
+
+    if (data->humidity_percent < 0.0f || data->humidity_percent > 100.0f) {
+        return ESP_ERR_INVALID_RESPONSE;
+    }
+
+    if (data->temperature_c < -40.0f || data->temperature_c > 80.0f) {
+        return ESP_ERR_INVALID_RESPONSE;
+    }
+
+    return ESP_OK;
+}
+
 static void dht_set_output(void)
 {
     gpio_set_direction(s_dht_gpio, GPIO_MODE_OUTPUT_OD);
@@ -115,7 +144,7 @@ esp_err_t dht_manager_read(dht_manager_data_t *out_data)
     if (s_dht_type == DHT_MANAGER_TYPE_DHT11) {
         out_data->humidity_percent = (float)data[0];
         out_data->temperature_c = (float)data[2];
-        return ESP_OK;
+        return validate_reading(out_data);
     }
 
     uint16_t raw_humidity = ((uint16_t)data[0] << 8) | data[1];
@@ -129,5 +158,5 @@ esp_err_t dht_manager_read(dht_manager_data_t *out_data)
         out_data->temperature_c = -out_data->temperature_c;
     }
 
-    return ESP_OK;
+    return validate_reading(out_data);
 }

@@ -12,7 +12,8 @@
   "clangd.arguments": [
     "--background-index",
     "--query-driver=**",
-    "--compile-commands-dir=c:\\Users\\Josh\\esp32now_tx\\build"
+    "--compile-commands-dir=c:\\Users\\Josh\\Desktop\\uni proj iot\\Advanced-IoT-Mine-Safety-Monorepo\\ESPWearableTransceiver\\build"
   ],
-  "idf.flashType": "UART"
+  "idf.flashType": "UART",
+  "idf.monitorPort": "COM6"
 }
