@@ -1,0 +1,7 @@
+{
+  "permissions": {
+    "allow": [
+      "Bash(python -c \"import ast; ast.parse\\(open\\(r'c:/Users/Josh/Desktop/uni proj iot/uart_audio.py', encoding='utf-8'\\).read\\(\\)\\); print\\('syntax OK'\\)\")"
+    ]
+  }
+}

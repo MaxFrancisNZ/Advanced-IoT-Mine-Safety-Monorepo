@@ -14,6 +14,8 @@ static const char *TAG = "ESPNOW";
 static uint8_t s_peer_mac[6] = {0};
 static SemaphoreHandle_t s_send_done_sem = NULL;
 static esp_now_send_status_t s_last_send_status = ESP_NOW_SEND_FAIL;
+static espnow_manager_recv_cb_t s_recv_cb = NULL;
+static void *s_recv_cb_context = NULL;
 
 static void wifi_init_sta(uint8_t channel)
 {
@@ -51,6 +53,18 @@ static void espnow_send_cb(const esp_now_send_info_t *tx_info, esp_now_send_stat
     }
 }
 
+static void espnow_recv_cb(const esp_now_recv_info_t *recv_info, const uint8_t *data, int len)
+{
+    if (recv_info == NULL || recv_info->src_addr == NULL || data == NULL || len <= 0) {
+        ESP_LOGW(TAG, "Receive callback received invalid arguments");
+        return;
+    }
+
+    if (s_recv_cb != NULL) {
+        s_recv_cb(recv_info->src_addr, data, len, s_recv_cb_context);
+    }
+}
+
 esp_err_t espnow_manager_init(const espnow_manager_config_t *config)
 {
     if (config == NULL || config->log_tag == NULL) {
@@ -71,6 +85,7 @@ esp_err_t espnow_manager_init(const espnow_manager_config_t *config)
 
     ESP_ERROR_CHECK(esp_now_init());
     ESP_ERROR_CHECK(esp_now_register_send_cb(espnow_send_cb));
+    ESP_ERROR_CHECK(esp_now_register_recv_cb(espnow_recv_cb));
 
     esp_now_peer_info_t peer = {0};
     memcpy(peer.peer_addr, config->peer_mac, sizeof(peer.peer_addr));
@@ -114,5 +129,12 @@ esp_err_t espnow_manager_send_and_wait(const uint8_t *data, size_t len, uint32_t
     }
 
     *out_delivered = (s_last_send_status == ESP_NOW_SEND_SUCCESS);
+    return ESP_OK;
+}
+
+esp_err_t espnow_manager_register_recv_cb(espnow_manager_recv_cb_t callback, void *context)
+{
+    s_recv_cb = callback;
+    s_recv_cb_context = context;
     return ESP_OK;
 }

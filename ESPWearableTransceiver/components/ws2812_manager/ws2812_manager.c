@@ -19,6 +19,7 @@ static const char *TAG = "ws2812";
 
 static rmt_channel_handle_t s_rmt_channel = NULL;
 static rmt_encoder_handle_t s_encoder = NULL;
+static gpio_num_t s_gpio_num = GPIO_NUM_NC;
 
 /* ---- Simple bytes encoder using copy + raw encoding ---- */
 
@@ -132,6 +133,13 @@ static esp_err_t ws2812_encoder_create(rmt_encoder_handle_t *ret_encoder)
 
 esp_err_t ws2812_manager_init(gpio_num_t gpio_num)
 {
+    if (s_rmt_channel != NULL && s_encoder != NULL) {
+        if (s_gpio_num == gpio_num) {
+            return ESP_OK;
+        }
+        return ESP_ERR_INVALID_STATE;
+    }
+
     rmt_tx_channel_config_t tx_cfg = {
         .gpio_num = gpio_num,
         .clk_src = RMT_CLK_SRC_DEFAULT,
@@ -149,6 +157,7 @@ esp_err_t ws2812_manager_init(gpio_num_t gpio_num)
     err = rmt_enable(s_rmt_channel);
     if (err != ESP_OK) return err;
 
+    s_gpio_num = gpio_num;
     ESP_LOGI(TAG, "WS2812 initialised on GPIO %d", gpio_num);
     return ESP_OK;
 }
@@ -164,7 +173,12 @@ esp_err_t ws2812_manager_set_color(uint8_t red, uint8_t green, uint8_t blue)
         .loop_count = 0,
     };
 
-    esp_err_t err = rmt_transmit(s_rmt_channel, s_encoder, grb, sizeof(grb), &tx_config);
+    /* Reset encoder state before each transmit so repeated updates from the
+     * status LED task don't leave the RMT encoder stuck between frames. */
+    esp_err_t err = rmt_encoder_reset(s_encoder);
+    if (err != ESP_OK) return err;
+
+    err = rmt_transmit(s_rmt_channel, s_encoder, grb, sizeof(grb), &tx_config);
     if (err != ESP_OK) return err;
 
     return rmt_tx_wait_all_done(s_rmt_channel, -1);

@@ -18,18 +18,21 @@
 #include "adpcm.h"
 #include "audio_protocol.h"
 #include "ws2812_manager.h"
+#include "status_led_manager.h"
+#include "web_monitor_manager.h"
 
 /* Hardware configuration */
 #define I2C_SDA_GPIO 18
 #define I2C_SCL_GPIO 5
 #define I2C_PORT_NUM I2C_NUM_0
-#define I2C_FREQ_HZ 100000
+#define I2C_FREQ_HZ 50000
 #define ESPNOW_CHANNEL 1
 #define LED_GPIO GPIO_NUM_16
 #define BATTERY_SENSE_GPIO GPIO_NUM_35
 #define MPU6050_ADDR 0x68
 #define BMP180_ADDR 0x77
-#define BMP180_OSS 0
+#define BMP180_OSS 3
+#define BMP180_PRESSURE_OFFSET_HPA (-3.0f)
 
 #define HUMITURE_GPIO GPIO_NUM_4
 #define HUMITURE_TYPE DHT_MANAGER_TYPE_DHT11
@@ -39,6 +42,8 @@
 #define MIC_I2S_DIN_GPIO  GPIO_NUM_25
 #define BUTTON_GPIO       GPIO_NUM_14
 #define WS2812_GPIO       GPIO_NUM_12
+#define WEB_MONITOR_AP_SSID     "ESPWearableMonitor"
+#define WEB_MONITOR_AP_PASSWORD "wearable123"
 
 #define AUDIO_SAMPLE_RATE    8000
 #define AUDIO_MAX_SECONDS    5
@@ -59,6 +64,7 @@ static bool battery_probe_ready = false;
 static battery_probe_reading_t last_battery_reading = {0};
 static bool battery_reading_valid = false;
 static volatile bool audio_active = false;
+static uint8_t base_station_mac[6] = {0};
 
 
 /* Forward declarations */
@@ -71,10 +77,78 @@ static void initialize_sensors(void);
 static void log_battery_probe(void);
 static void refresh_battery_probe(void);
 static void send_audio_chunks(const uint8_t *adpcm_data, size_t adpcm_len, uint32_t total_samples);
+static void handle_base_station_message(const uint8_t *mac_addr, const uint8_t *data, int len, void *context);
+static bool matches_json_field(const char *json, const char *field_name, const char *field_value);
+static void normalize_json_string(const uint8_t *data, int len, char *buffer, size_t buffer_len);
 
 static void log_sensor_error(const char *sensor_name, esp_err_t err)
 {
     ESP_LOGW(TAG, "%s unavailable: %s", sensor_name, esp_err_to_name(err));
+}
+
+static void normalize_json_string(const uint8_t *data, int len, char *buffer, size_t buffer_len)
+{
+    size_t out_index = 0;
+
+    if (buffer_len == 0U) {
+        return;
+    }
+
+    for (int i = 0; i < len && out_index < (buffer_len - 1U); ++i) {
+        char ch = (char)data[i];
+        if (ch == ' ' || ch == '\t' || ch == '\r' || ch == '\n') {
+            continue;
+        }
+        buffer[out_index++] = ch;
+    }
+
+    buffer[out_index] = '\0';
+}
+
+static bool matches_json_field(const char *json, const char *field_name, const char *field_value)
+{
+    char token[64];
+
+    snprintf(token, sizeof(token), "\"%s\":\"%s\"", field_name, field_value);
+    return strstr(json, token) != NULL;
+}
+
+static void handle_base_station_message(const uint8_t *mac_addr, const uint8_t *data, int len, void *context)
+{
+    (void)context;
+
+    char normalized_json[128];
+
+    if (mac_addr == NULL || data == NULL || len <= 0) {
+        return;
+    }
+
+    if (memcmp(mac_addr, base_station_mac, sizeof(base_station_mac)) != 0) {
+        ESP_LOGW(TAG,
+                 "Ignoring command from unknown peer %02X:%02X:%02X:%02X:%02X:%02X",
+                 mac_addr[0], mac_addr[1], mac_addr[2],
+                 mac_addr[3], mac_addr[4], mac_addr[5]);
+        return;
+    }
+
+    normalize_json_string(data, len, normalized_json, sizeof(normalized_json));
+    if (!matches_json_field(normalized_json, "type", "led_override")) {
+        return;
+    }
+
+    if (matches_json_field(normalized_json, "mode", "alert_on")) {
+        ESP_LOGI(TAG, "Received remote LED alert enable");
+        status_led_manager_set_remote_override(true);
+        return;
+    }
+
+    if (matches_json_field(normalized_json, "mode", "alert_off")) {
+        ESP_LOGI(TAG, "Received remote LED alert clear");
+        status_led_manager_set_remote_override(false);
+        return;
+    }
+
+    ESP_LOGW(TAG, "Ignoring unknown LED override command: %s", normalized_json);
 }
 
 static void format_optional_float(char *buffer, size_t buffer_len, bool has_value, float value, uint8_t decimals)
@@ -159,6 +233,7 @@ static void format_payload(char *json, size_t json_len, uint32_t transmission_at
     bool has_accel = false;
     bool has_gyro = false;
     bool has_pressure = false;
+    status_led_inputs_t led_inputs = {0};
 
     char temperature[16];
     char humidity[16];
@@ -215,8 +290,19 @@ static void format_payload(char *json, size_t json_len, uint32_t transmission_at
     format_optional_float(gyro_x, sizeof(gyro_x), has_gyro, (float)mpu_data.gyro_x / 131.0f, 3);
     format_optional_float(gyro_y, sizeof(gyro_y), has_gyro, (float)mpu_data.gyro_y / 131.0f, 3);
     format_optional_float(gyro_z, sizeof(gyro_z), has_gyro, (float)mpu_data.gyro_z / 131.0f, 3);
-    format_optional_float(pressure, sizeof(pressure), has_pressure, (float)bmp_data.pressure_pa / 100.0f, 2);
+    format_optional_float(pressure, sizeof(pressure), has_pressure, ((float)bmp_data.pressure_pa / 100.0f) + BMP180_PRESSURE_OFFSET_HPA, 2);
     format_optional_float(battery_voltage, sizeof(battery_voltage), battery_reading_valid, last_battery_reading.battery_voltage, 3);
+
+    led_inputs.temperature_available = has_temperature;
+    led_inputs.temperature_c = dht_err == ESP_OK ? dht_data.temperature_c :
+                               (bmp_err == ESP_OK ? bmp_data.temperature_c : mpu_data.temperature_c);
+    led_inputs.humidity_available = has_humidity;
+    led_inputs.humidity_percent = dht_data.humidity_percent;
+    led_inputs.battery_available = battery_reading_valid;
+    led_inputs.battery_voltage = last_battery_reading.battery_voltage;
+    led_inputs.extreme_acceleration_detected = false;
+    led_inputs.prolonged_lying_down_detected = false;
+    status_led_manager_update_inputs(&led_inputs);
 
     snprintf(json, json_len,
              "{"
@@ -230,7 +316,8 @@ static void format_payload(char *json, size_t json_len, uint32_t transmission_at
              "\"gyroscope\":{\"x\":%s,\"y\":%s,\"z\":%s},"
              "\"barometric_pressure\":%s"
              "},"
-             "\"led_state\":\"%s\""
+             "\"led_state\":\"%s\","
+             "\"led_override_active\":%s"
              "}",
              node_id,
              transmission_attempts,
@@ -244,7 +331,8 @@ static void format_payload(char *json, size_t json_len, uint32_t transmission_at
              gyro_y,
              gyro_z,
              pressure,
-             led_manager_is_on() ? "#00FF00" : "#000000");
+             status_led_manager_get_render_state_name(),
+             status_led_manager_is_remote_override_active() ? "true" : "false");
 }
 
 /* Send ADPCM audio as chunked ESP-NOW packets */
@@ -412,6 +500,11 @@ static void send_task(void *pvParameters)
 /* Application entry point */
 void app_main(void)
 {
+    esp_err_t early_web_monitor_err = web_monitor_manager_early_init();
+    if (early_web_monitor_err != ESP_OK) {
+        ESP_LOGW(TAG, "Early web monitor capture init failed: %s", esp_err_to_name(early_web_monitor_err));
+    }
+
     const i2c_manager_config_t i2c_config = {
         .port = I2C_PORT_NUM,
         .sda_io_num = I2C_SDA_GPIO,
@@ -456,6 +549,20 @@ void app_main(void)
     ESP_ERROR_CHECK(ret);
 
     ESP_ERROR_CHECK(espnow_manager_init(&espnow_config));
+    memcpy(base_station_mac, espnow_config.peer_mac, sizeof(base_station_mac));
+    ESP_ERROR_CHECK(espnow_manager_register_recv_cb(handle_base_station_message, NULL));
+
+    const web_monitor_manager_config_t web_monitor_config = {
+        .ap_ssid = WEB_MONITOR_AP_SSID,
+        .ap_password = WEB_MONITOR_AP_PASSWORD,
+        .channel = ESPNOW_CHANNEL,
+        .max_connections = 1,
+    };
+    esp_err_t web_monitor_err = web_monitor_manager_init(&web_monitor_config);
+    if (web_monitor_err != ESP_OK) {
+        ESP_LOGW(TAG, "Web monitor init failed: %s", esp_err_to_name(web_monitor_err));
+    }
+
     uint8_t wifi_sta_mac[6] = {0};
     ESP_ERROR_CHECK(esp_read_mac(wifi_sta_mac, ESP_MAC_WIFI_STA));
     snprintf(node_id, sizeof(node_id), "%02X:%02X:%02X:%02X:%02X:%02X",
@@ -474,16 +581,26 @@ void app_main(void)
         ESP_LOGE(TAG, "Microphone init failed: %s", esp_err_to_name(mic_err));
     }
 
+    esp_err_t ws_err = ws2812_manager_init(WS2812_GPIO);
+    if (ws_err != ESP_OK) {
+        ESP_LOGW(TAG, "WS2812 init failed during boot test: %s", esp_err_to_name(ws_err));
+    } else {
+        esp_err_t ws_color_err = ws2812_manager_set_color(0, 0, 30);
+        if (ws_color_err != ESP_OK) {
+            ESP_LOGW(TAG, "WS2812 blue boot test failed: %s", esp_err_to_name(ws_color_err));
+        } else {
+            vTaskDelay(pdMS_TO_TICKS(1000));
+        }
+    }
+
+    esp_err_t status_led_err = status_led_manager_init(WS2812_GPIO);
+    if (status_led_err != ESP_OK) {
+        ESP_LOGW(TAG, "Status LED init failed: %s", esp_err_to_name(status_led_err));
+    }
+
     xTaskCreate(send_task, "send_task", 4096, NULL, 4, NULL);
     xTaskCreate(button_task, "button_task", 8192, NULL, 5, NULL);
 
-    /* WS2812 status LED – green on boot */
-    esp_err_t ws_err = ws2812_manager_init(WS2812_GPIO);
-    if (ws_err != ESP_OK) {
-        ESP_LOGW(TAG, "WS2812 init failed: %s", esp_err_to_name(ws_err));
-    } else {
-        ws2812_manager_set_color(0, 30, 0);
-    }
-
     ESP_LOGI(TAG, "Transmitter ready");
+    web_monitor_manager_finalize_startup_history();
 }

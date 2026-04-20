@@ -9,8 +9,8 @@
     },
     "env": {},
     "idfTarget": "esp32",
-    "flashBaudRate": "",
-    "monitorBaudRate": "",
+    "flashBaudRate": "57600",
+    "monitorBaudRate": "57600",
     "openOCD": {
       "debugLevel": -1,
       "configs": [],
