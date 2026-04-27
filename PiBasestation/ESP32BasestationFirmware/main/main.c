@@ -109,7 +109,6 @@ static void espnow_init(void)
     esp_now_peer_info_t broadcast_peer = {0};
 
     ESP_ERROR_CHECK(esp_now_init());
-    ESP_ERROR_CHECK(esp_now_register_recv_cb(espnow_recv_cb));
 
     memcpy(broadcast_peer.peer_addr, ESPNOW_BROADCAST_ADDR, ESP_NOW_ETH_ALEN);
     broadcast_peer.channel = ESPNOW_CHANNEL;
@@ -118,7 +117,13 @@ static void espnow_init(void)
 
     ESP_ERROR_CHECK(esp_now_add_peer(&broadcast_peer));
 
-    ESP_LOGI(TAG, "ESP-NOW initialized");
+    ESP_LOGI(TAG, "ESP-NOW initialized (recv callback not yet registered)");
+}
+
+static void espnow_start_receiving(void)
+{
+    ESP_ERROR_CHECK(esp_now_register_recv_cb(espnow_recv_cb));
+    ESP_LOGI(TAG, "ESP-NOW recv callback registered");
 }
 
 static void espnow_to_uart_task(void *pvParameters)
@@ -200,12 +205,19 @@ void app_main(void)
         return;
     }
 
+    // Bring up the UART bridge first so the consumer side of the queue
+    // is ready before we accept any ESP-NOW packets.
     uart_bridge_init();
+
     wifi_init_sta();
     espnow_init();
 
+    // Start the forwarding task before registering the ESP-NOW recv
+    // callback so no incoming packets land in the queue undrained.
     xTaskCreate(espnow_to_uart_task, "espnow_to_uart", 4096, NULL, 4, NULL);
     xTaskCreate(uart_to_espnow_task, "uart_to_espnow", 4096, NULL, 4, NULL);
+
+    espnow_start_receiving();
 
     ESP_LOGI(TAG, "ESP-NOW <-> UART bridge ready");
 }
