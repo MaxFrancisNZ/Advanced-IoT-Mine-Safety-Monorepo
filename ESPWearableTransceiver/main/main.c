@@ -514,7 +514,7 @@ void app_main(void)
         .glitch_ignore_cnt = 7,
     };
     const espnow_manager_config_t espnow_config = {
-        .peer_mac = {0x5c, 0x01, 0x3b, 0x8a, 0xdb, 0xbc},
+        .peer_mac = {0x24, 0x6f, 0x28, 0xb9, 0xb4, 0xb0},
         .channel = ESPNOW_CHANNEL,
         .encrypt = false,
         .log_tag = TAG,

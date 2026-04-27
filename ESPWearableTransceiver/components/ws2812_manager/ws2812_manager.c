@@ -104,15 +104,15 @@ static esp_err_t ws2812_encoder_create(rmt_encoder_handle_t *ret_encoder)
 
     rmt_bytes_encoder_config_t bytes_config = {
         .bit0 = {
-            .duration0 = WS2812_T0H_NS * RMT_RESOLUTION_HZ / 1000000000,
+            .duration0 = (uint32_t)WS2812_T0H_NS * RMT_RESOLUTION_HZ / 1000000000,
             .level0 = 1,
-            .duration1 = WS2812_T0L_NS * RMT_RESOLUTION_HZ / 1000000000,
+            .duration1 = (uint32_t)WS2812_T0L_NS * RMT_RESOLUTION_HZ / 1000000000,
             .level1 = 0,
         },
         .bit1 = {
-            .duration0 = WS2812_T1H_NS * RMT_RESOLUTION_HZ / 1000000000,
+            .duration0 = (uint32_t)WS2812_T1H_NS * RMT_RESOLUTION_HZ / 1000000000,
             .level0 = 1,
-            .duration1 = WS2812_T1L_NS * RMT_RESOLUTION_HZ / 1000000000,
+            .duration1 = (uint32_t)WS2812_T1L_NS * RMT_RESOLUTION_HZ / 1000000000,
             .level1 = 0,
         },
         .flags.msb_first = true,

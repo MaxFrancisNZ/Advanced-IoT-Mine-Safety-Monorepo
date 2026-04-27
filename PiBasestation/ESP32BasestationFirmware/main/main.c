@@ -131,10 +131,11 @@ static void espnow_to_uart_task(void *pvParameters)
             uart_write_bytes(UART_BRIDGE_PORT, "\n", 1);
 
             ESP_LOGI(TAG,
-                     "Forwarded %d bytes from %02X:%02X:%02X:%02X:%02X:%02X to UART",
+                     "Forwarded %d bytes from %02X:%02X:%02X:%02X:%02X:%02X to UART\n%s",
                      msg.len,
                      msg.mac[0], msg.mac[1], msg.mac[2],
-                     msg.mac[3], msg.mac[4], msg.mac[5]);
+                     msg.mac[3], msg.mac[4], msg.mac[5],
+                     msg.data);
         }
     }
 }
