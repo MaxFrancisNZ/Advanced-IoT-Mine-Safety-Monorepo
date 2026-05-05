@@ -351,10 +351,17 @@
         }
 
         function loadData() {
-            db.collection('iot-data').orderBy('received_at', 'desc').limit(100).onSnapshot(snapshot => {
+            const query = db.collection('iot-data').limit(100);
+            query.onSnapshot(snapshot => {
                 updateConnection(true);
                 const rows = [];
                 snapshot.forEach(doc => rows.push(doc));
+                // Sort by received_at descending, treating missing timestamps as old
+                rows.sort((a, b) => {
+                    const aTime = a.data().received_at?.toDate?.()?.getTime?.() || 0;
+                    const bTime = b.data().received_at?.toDate?.()?.getTime?.() || 0;
+                    return bTime - aTime;
+                });
                 updateMiniStats(rows);
                 updateEnvironmentStatus(rows);
                 updateDeviceStatus(rows);
