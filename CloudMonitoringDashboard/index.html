@@ -1,279 +1,138 @@
 <!DOCTYPE html>
 <html lang="en">
 <head>
-    <meta charset="UTF-8">
-    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <meta charset="UTF-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1.0" />
     <title>IoT Mine Safety Dashboard</title>
+
     <script src="https://www.gstatic.com/firebasejs/10.7.1/firebase-app-compat.js"></script>
     <script src="https://www.gstatic.com/firebasejs/10.7.1/firebase-firestore-compat.js"></script>
     <script src="https://cdn.jsdelivr.net/npm/chart.js"></script>
+
     <style>
-        * { margin: 0; padding: 0; box-sizing: border-box; }
-        body {
-            font-family: 'Segoe UI', Tahoma, Geneva, Verdana, sans-serif;
-            background: #f5f5f5;
-            color: #333;
-        }
-        .dashboard {
-            min-height: 100vh;
-            padding: 20px;
-        }
-        .header {
-            background: white;
-            padding: 20px;
-            border-radius: 8px;
-            margin-bottom: 20px;
-            box-shadow: 0 2px 4px rgba(0,0,0,0.1);
-        }
-        .header h1 {
-            font-size: 28px;
-            margin-bottom: 10px;
-            color: #1a1a1a;
-        }
-        .header-info {
-            display: flex;
-            gap: 20px;
-            flex-wrap: wrap;
-        }
-        .stat-box {
-            flex: 1;
-            min-width: 200px;
-            background: #f9f9f9;
-            padding: 15px;
-            border-radius: 6px;
-            border-left: 4px solid #2196F3;
-        }
-        .stat-box h3 {
-            font-size: 12px;
-            font-weight: 600;
-            color: #666;
-            text-transform: uppercase;
-            margin-bottom: 8px;
-        }
-        .stat-value {
-            font-size: 20px;
-            font-weight: bold;
-            color: #2196F3;
-        }
-        .mini-chart {
-            width: 100%;
-            height: 60px;
-            margin-top: 8px;
-        }
-        .grid-container {
-            display: grid;
-            grid-template-columns: 1fr 1fr 1fr;
-            gap: 20px;
-            margin-bottom: 20px;
-        }
-        .section {
-            background: white;
-            border-radius: 8px;
-            padding: 20px;
-            box-shadow: 0 2px 4px rgba(0,0,0,0.1);
-        }
-        .section h2 {
-            font-size: 16px;
-            font-weight: 600;
-            margin-bottom: 15px;
-            color: #1a1a1a;
-            text-transform: uppercase;
-            border-bottom: 2px solid #f0f0f0;
-            padding-bottom: 10px;
-        }
-        .node-item {
-            padding: 12px;
-            margin-bottom: 10px;
-            background: #f9f9f9;
-            border-radius: 6px;
-            display: flex;
-            justify-content: space-between;
-            align-items: center;
-            border-left: 3px solid #2196F3;
-        }
-        .node-item.warning {
-            border-left-color: #ff9800;
-        }
-        .node-item.danger {
-            border-left-color: #f44336;
-        }
-        .node-label {
-            font-weight: 500;
-            color: #333;
-            font-size: 13px;
-        }
-        .node-value {
-            font-size: 12px;
-            color: #666;
-        }
-        .device-list {
-            display: flex;
-            flex-direction: column;
-            gap: 8px;
-        }
-        .device-item {
-            display: flex;
-            align-items: center;
-            gap: 10px;
-            padding: 10px;
-            background: #f9f9f9;
-            border-radius: 4px;
-            font-size: 13px;
-        }
-        .device-status {
-            width: 8px;
-            height: 8px;
-            border-radius: 50%;
-            background: #4caf50;
-            flex-shrink: 0;
-        }
-        .device-status.offline {
-            background: #999;
-        }
-        .device-status.warning {
-            background: #ff9800;
-        }
-        .log-item {
-            padding: 12px;
-            margin-bottom: 10px;
-            background: #f9f9f9;
-            border-radius: 6px;
-            border-left: 3px solid #2196F3;
-            font-size: 12px;
-        }
-        .log-item.info {
-            border-left-color: #2196F3;
-        }
-        .log-item.warning {
-            border-left-color: #ff9800;
-            background: #fffbf0;
-        }
-        .log-item.danger {
-            border-left-color: #f44336;
-            background: #ffebee;
-        }
-        .log-time {
-            font-size: 11px;
-            color: #999;
-            margin-bottom: 4px;
-        }
-        .log-message {
-            color: #333;
-            margin-bottom: 4px;
-        }
-        .log-status {
-            display: inline-block;
-            padding: 2px 8px;
-            border-radius: 3px;
-            font-size: 10px;
-            font-weight: 600;
-            text-transform: uppercase;
-        }
-        .log-status.online {
-            background: #c8e6c9;
-            color: #2e7d32;
-        }
-        .log-status.offline {
-            background: #e0e0e0;
-            color: #424242;
-        }
-        .log-status.warning {
-            background: #ffe0b2;
-            color: #e65100;
-        }
-        .log-status.danger {
-            background: #ffcdd2;
-            color: #c62828;
-        }
-        .status-connection {
-            display: flex;
-            align-items: center;
-            gap: 8px;
-            font-size: 12px;
-            margin-top: 15px;
-            padding-top: 15px;
-            border-top: 1px solid #f0f0f0;
-        }
-        .status-dot {
-            width: 8px;
-            height: 8px;
-            border-radius: 50%;
-            background: #4caf50;
-        }
-        .status-dot.disconnected {
-            background: #f44336;
-        }
-        @media (max-width: 1200px) {
-            .grid-container {
-                grid-template-columns: 1fr 1fr;
-            }
-        }
-        @media (max-width: 768px) {
-            .grid-container {
-                grid-template-columns: 1fr;
-            }
-            .header-info {
-                flex-direction: column;
-            }
-        }
+        * { box-sizing: border-box; }
+        html, body { margin: 0; padding: 0; min-height: 100%; font-family: 'Segoe UI', Tahoma, Geneva, Verdana, sans-serif; background: #eef2f7; }
+        body { color: #1f2937; }
+        .dashboard { max-width: 1280px; margin: 0 auto; padding: 24px; }
+
+        .top-bar { display: flex; flex-wrap: wrap; justify-content: space-between; gap: 16px; margin-bottom: 18px; }
+        .title-block { max-width: 720px; }
+        .title-block h1 { font-size: 34px; margin-bottom: 8px; letter-spacing: -0.03em; }
+        .title-block p { color: #4b5563; font-size: 14px; line-height: 1.7; }
+        .status-chip { display: inline-flex; align-items: center; gap: 10px; padding: 10px 14px; background: #f8fafc; border-radius: 999px; border: 1px solid #d1d5db; color: #111827; font-weight: 600; }
+        .status-dot { width: 10px; height: 10px; border-radius: 999px; background: #34d399; }
+        .status-dot.offline { background: #f87171; }
+
+        .alert-banner { border-radius: 16px; padding: 16px 20px; display: flex; align-items: center; gap: 12px; margin-bottom: 20px; border: 1px solid transparent; }
+        .alert-banner.normal { background: #eff6ff; color: #1d4ed8; border-color: #bfdbfe; }
+        .alert-banner.warning { background: #fffbeb; color: #92400e; border-color: #fde68a; }
+        .alert-banner.danger { background: #fef2f2; color: #b91c1c; border-color: #fecaca; }
+
+        .summary-grid { display: grid; grid-template-columns: repeat(3, minmax(0, 1fr)); gap: 18px; margin-bottom: 20px; }
+        .card { background: #ffffff; border-radius: 20px; padding: 22px; border: 1px solid rgba(148, 163, 184, 0.18); box-shadow: 0 14px 36px rgba(15, 23, 42, 0.06); }
+        .card h2 { margin: 0 0 10px; font-size: 12px; color: #64748b; text-transform: uppercase; letter-spacing: 0.12em; }
+        .card .value { font-size: 38px; font-weight: 700; color: #0f172a; line-height: 1; }
+        .card .subtitle { margin-top: 10px; color: #64748b; font-size: 13px; }
+        .mini-chart { width: 100%; height: 88px; margin-top: 18px; }
+
+        .main-grid { display: grid; grid-template-columns: 1.55fr 1fr; gap: 18px; }
+        .section { background: #ffffff; border-radius: 20px; padding: 22px; border: 1px solid rgba(148, 163, 184, 0.18); box-shadow: 0 14px 36px rgba(15, 23, 42, 0.06); }
+        .section h2 { margin-top: 0; margin-bottom: 8px; font-size: 18px; color: #0f172a; }
+        .section p { margin-top: 0; margin-bottom: 18px; color: #475569; font-size: 13px; line-height: 1.7; }
+
+        .status-list, .log-list { display: grid; gap: 14px; }
+        .status-card, .log-card { background: #f8fafc; border-radius: 16px; padding: 16px 18px; border: 1px solid rgba(148, 163, 184, 0.18); }
+        .status-card strong, .log-card strong { display: block; margin-bottom: 6px; font-size: 14px; color: #111827; }
+        .status-card small, .log-card small { color: #64748b; font-size: 12px; }
+        .status-pill { display: inline-flex; padding: 6px 12px; border-radius: 999px; font-size: 11px; font-weight: 700; letter-spacing: 0.08em; text-transform: uppercase; }
+        .pill-online { background: #dcfce7; color: #166534; }
+        .pill-warning { background: #ffedd5; color: #9a3412; }
+        .pill-danger { background: #fee2e2; color: #991b1b; }
+
+        .scroll-panel { max-height: 360px; overflow-y: auto; padding-right: 4px; }
+        .scroll-panel::-webkit-scrollbar { width: 8px; }
+        .scroll-panel::-webkit-scrollbar-track { background: transparent; }
+        .scroll-panel::-webkit-scrollbar-thumb { background: rgba(148, 163, 184, 0.5); border-radius: 999px; }
+
+        .empty-state { text-align: center; padding: 38px 0; color: #94a3b8; }
+
+        @media (max-width: 980px) { .summary-grid, .main-grid { grid-template-columns: 1fr; } }
     </style>
 </head>
 <body>
     <div class="dashboard">
-        <div class="header">
-            <h1>IoT Mine Safety Monitoring</h1>
-            <div class="header-info">
-                <div class="stat-box">
-                    <h3>Temperature</h3>
-                    <div class="stat-value" id="tempStat">--°C</div>
-                    <canvas id="tempMiniChart" class="mini-chart"></canvas>
+        <div class="top-bar">
+            <div class="title-block">
+                <h1>IoT Mine Safety Monitoring</h1>
+                <p>Realtime sensor view for temperature, humidity, pressure, node status, and audio/transcription alerts.</p>
+            </div>
+            <div class="status-chip" id="connectionChip">
+                <span id="connectionDot" class="status-dot"></span>
+                <span id="connectionText">Connecting to Firebase...</span>
+            </div>
+        </div>
+
+        <div id="alertBanner" class="alert-banner normal">No active alerts. System normal.</div>
+
+        <div class="summary-grid">
+            <div class="card">
+                <h2>Temperature</h2>
+                <div class="value" id="tempStat">--°C</div>
+                <div class="subtitle">Latest node reading</div>
+                <canvas id="tempMiniChart" class="mini-chart"></canvas>
+            </div>
+            <div class="card">
+                <h2>Humidity</h2>
+                <div class="value" id="humidStat">--%</div>
+                <div class="subtitle">Latest node reading</div>
+                <canvas id="humidMiniChart" class="mini-chart"></canvas>
+            </div>
+            <div class="card">
+                <h2>Elevation / Pressure</h2>
+                <div class="value" id="elevStat">-- m</div>
+                <div class="subtitle">Latest node reading</div>
+                <canvas id="elevMiniChart" class="mini-chart"></canvas>
+            </div>
+        </div>
+
+        <div class="main-grid">
+            <div class="section">
+                <h2>Environment Status</h2>
+                <p>Latest reading from each node, updated in realtime.</p>
+                <div id="environmentStatus" class="status-list scroll-panel">
+                    <div class="empty-state">Loading environment status…</div>
                 </div>
-                <div class="stat-box">
-                    <h3>Humidity</h3>
-                    <div class="stat-value" id="humidStat">--%</div>
-                    <canvas id="humidMiniChart" class="mini-chart"></canvas>
-                </div>
-                <div class="stat-box">
-                    <h3>Elevation</h3>
-                    <div class="stat-value" id="elevStat">-- m</div>
-                    <canvas id="elevMiniChart" class="mini-chart"></canvas>
+            </div>
+
+            <div class="section">
+                <h2>Device Status</h2>
+                <p>Node online/offline state and recent heartbeat information.</p>
+                <div id="deviceStatus" class="status-list scroll-panel">
+                    <div class="empty-state">Loading device status…</div>
                 </div>
             </div>
         </div>
 
-        <div class="grid-container">
-            <!-- Environment Status -->
+        <div class="main-grid" style="margin-top: 18px;">
             <div class="section">
-                <h2>Environment Status</h2>
-                <div id="environmentStatus" class="device-list">
-                    <div style="text-align: center; color: #999; padding: 20px;">Loading...</div>
+                <h2>Health & Alert Log</h2>
+                <p>Recent health events and warning messages from node sensors.</p>
+                <div id="healthLog" class="log-list scroll-panel">
+                    <div class="empty-state">Loading health log…</div>
                 </div>
             </div>
 
-            <!-- Device Status -->
             <div class="section">
-                <h2>Device Status</h2>
-                <div id="deviceStatus" class="device-list">
-                    <div style="text-align: center; color: #999; padding: 20px;">Loading...</div>
-                </div>
-            </div>
-
-            <!-- Health & Transcriptions -->
-            <div class="section">
-                <h2>Health Status & Log</h2>
-                <div id="healthLog" style="max-height: 400px; overflow-y: auto;">
-                    <div style="text-align: center; color: #999; padding: 20px;">Loading...</div>
-                </div>
-                <div class="status-connection">
-                    <div class="status-dot" id="connectionStatus"></div>
-                    <span id="connectionText">Connecting...</span>
+                <h2>Transcriptions / Audio Alerts</h2>
+                <p>Latest speech or warning text captured by the nodes.</p>
+                <div id="transcriptionLog" class="log-list scroll-panel">
+                    <div class="empty-state">No transcription data yet.</div>
                 </div>
             </div>
         </div>
     </div>
 
     <script>
-        // Firebase configuration
         const firebaseConfig = {
             apiKey: "AIzaSyAcZmW8CGW3eM4qQs2LR6ru5VDE1693oig",
             authDomain: "iot-mine-safety.firebaseapp.com",
@@ -283,266 +142,233 @@
             appId: "1:335965054917:web:19b4fb2d7c2d9dc9ba4dac"
         };
 
-        // Initialize Firebase
         firebase.initializeApp(firebaseConfig);
         const db = firebase.firestore();
-
         let miniCharts = {};
-        const nodeDataCache = {};
-        const eventLog = [];
-        const MAX_LOG_ITEMS = 50;
 
-        // Initialize mini charts
+        function formatTime(timestamp) {
+            if (!timestamp || !timestamp.toDate) return 'N/A';
+            return timestamp.toDate().toLocaleTimeString([], { hour: '2-digit', minute: '2-digit', second: '2-digit' });
+        }
+
         function initMiniCharts() {
-            const chartConfigs = [
-                { id: 'tempMiniChart', label: 'Temperature', color: 'rgb(255, 99, 132)' },
-                { id: 'humidMiniChart', label: 'Humidity', color: 'rgb(54, 162, 235)' },
-                { id: 'elevMiniChart', label: 'Elevation', color: 'rgb(75, 192, 192)' }
+            const defs = [
+                { id: 'tempMiniChart', color: 'rgb(239, 68, 68)' },
+                { id: 'humidMiniChart', color: 'rgb(37, 99, 235)' },
+                { id: 'elevMiniChart', color: 'rgb(16, 185, 129)' }
             ];
-
-            chartConfigs.forEach(config => {
-                const ctx = document.getElementById(config.id).getContext('2d');
-                miniCharts[config.id] = new Chart(ctx, {
+            defs.forEach(def => {
+                const ctx = document.getElementById(def.id).getContext('2d');
+                miniCharts[def.id] = new Chart(ctx, {
                     type: 'line',
-                    data: {
-                        labels: [],
-                        datasets: [{
-                            label: config.label,
-                            data: [],
-                            borderColor: config.color,
-                            backgroundColor: config.color + '20',
-                            borderWidth: 2,
-                            fill: true,
-                            tension: 0.3,
-                            pointRadius: 0,
-                            pointHoverRadius: 0
-                        }]
-                    },
-                    options: {
-                        responsive: true,
-                        maintainAspectRatio: false,
-                        plugins: { legend: { display: false } },
-                        scales: {
-                            x: { display: false },
-                            y: { display: false, beginAtZero: true }
-                        }
-                    }
+                    data: { labels: [], datasets: [{ data: [], borderColor: def.color, backgroundColor: def.color + '20', borderWidth: 2, fill: true, tension: 0.35, pointRadius: 0 }] },
+                    options: { responsive: true, maintainAspectRatio: false, plugins: { legend: { display: false } }, scales: { x: { display: false }, y: { display: false, beginAtZero: true } } }
                 });
             });
         }
 
-        // Update mini charts with data
-        function updateMiniCharts(data) {
-            if (data.length === 0) return;
+        function updateConnection(connected) {
+            const dot = document.getElementById('connectionDot');
+            const text = document.getElementById('connectionText');
+            const banner = document.getElementById('alertBanner');
+            dot.className = connected ? 'status-dot' : 'status-dot offline';
+            text.textContent = connected ? 'Connected to Firebase' : 'Disconnected from Firebase';
+            if (!connected) {
+                banner.className = 'alert-banner danger';
+                banner.textContent = 'Connection lost. Data may be stale.';
+            }
+        }
 
-            const sorted = data.slice().sort((a, b) => {
-                const aTime = a.data().received_at?.toDate?.()?.getTime?.() || 0;
-                const bTime = b.data().received_at?.toDate?.()?.getTime?.() || 0;
-                return aTime - bTime;
+        function updateMiniStats(rows) {
+            if (!rows.length) return;
+            const sorted = rows.slice().sort((a, b) => {
+                const aTs = a.data().received_at?.toDate?.()?.getTime?.() || 0;
+                const bTs = b.data().received_at?.toDate?.()?.getTime?.() || 0;
+                return aTs - bTs;
             }).slice(-20);
-
-            const labels = sorted.map((_, i) => i);
+            const labels = sorted.map((_, idx) => idx + 1);
             const temps = sorted.map(doc => doc.data().environment?.temperature ?? 0);
             const humids = sorted.map(doc => doc.data().environment?.humidity ?? 0);
-            const elevs = sorted.map(doc => doc.data().environment?.elevation ?? 0);
-
-            miniCharts['tempMiniChart'].data.labels = labels;
-            miniCharts['tempMiniChart'].data.datasets[0].data = temps;
-            miniCharts['tempMiniChart'].update();
-
-            miniCharts['humidMiniChart'].data.labels = labels;
-            miniCharts['humidMiniChart'].data.datasets[0].data = humids;
-            miniCharts['humidMiniChart'].update();
-
-            miniCharts['elevMiniChart'].data.labels = labels;
-            miniCharts['elevMiniChart'].data.datasets[0].data = elevs;
-            miniCharts['elevMiniChart'].update();
-
-            // Update stat values
-            if (temps.length > 0) {
-                document.getElementById('tempStat').textContent = temps[temps.length - 1].toFixed(1) + '°C';
-            }
-            if (humids.length > 0) {
-                document.getElementById('humidStat').textContent = humids[humids.length - 1].toFixed(0) + '%';
-            }
-            if (elevs.length > 0) {
-                document.getElementById('elevStat').textContent = elevs[elevs.length - 1].toFixed(0) + ' m';
-            }
+            const elevs = sorted.map(doc => doc.data().environment?.elevation ?? doc.data().environment?.barometric_pressure ?? 0);
+            miniCharts.tempMiniChart.data.labels = labels;
+            miniCharts.tempMiniChart.data.datasets[0].data = temps;
+            miniCharts.tempMiniChart.update();
+            miniCharts.humidMiniChart.data.labels = labels;
+            miniCharts.humidMiniChart.data.datasets[0].data = humids;
+            miniCharts.humidMiniChart.update();
+            miniCharts.elevMiniChart.data.labels = labels;
+            miniCharts.elevMiniChart.data.datasets[0].data = elevs;
+            miniCharts.elevMiniChart.update();
+            document.getElementById('tempStat').textContent = temps.at(-1).toFixed(1) + '°C';
+            document.getElementById('humidStat').textContent = humids.at(-1).toFixed(0) + '%';
+            document.getElementById('elevStat').textContent = elevs.at(-1).toFixed(0) + ' m';
         }
 
-        // Update environment status section
-        function updateEnvironmentStatus(data) {
-            const container = document.getElementById('environmentStatus');
-            if (data.length === 0) {
-                container.innerHTML = '<div style="text-align: center; color: #999;">No data available</div>';
+        function updateEnvironmentStatus(rows) {
+            const section = document.getElementById('environmentStatus');
+            if (!rows.length) {
+                section.innerHTML = '<div class="empty-state">No environment data available.</div>';
                 return;
             }
-
-            // Group by node_id and get latest
-            const nodes = {};
-            data.forEach(doc => {
-                const d = doc.data();
-                const nodeId = d.node_id || 'Unknown';
-                if (!nodes[nodeId] || new Date(d.received_at?.toDate?.()) > new Date(nodes[nodeId].received_at?.toDate?.())) {
-                    nodes[nodeId] = d;
-                }
+            const latest = {};
+            rows.forEach(doc => {
+                const payload = doc.data();
+                const nodeId = payload.node_id || 'Unknown';
+                const time = payload.received_at?.toDate?.()?.getTime?.() || 0;
+                if (!latest[nodeId] || time > latest[nodeId].time) latest[nodeId] = { payload, time };
             });
-
-            container.innerHTML = '';
-            Object.entries(nodes).forEach(([nodeId, nodeData]) => {
-                const temp = nodeData.environment?.temperature ?? 0;
-                const humid = nodeData.environment?.humidity ?? 0;
-                let statusClass = '';
-                
-                if (temp > 35) statusClass = 'danger';
-                else if (temp > 30) statusClass = 'warning';
-
-                const item = document.createElement('div');
-                item.className = `node-item ${statusClass}`;
-                item.innerHTML = `
-                    <div>
-                        <div class="node-label">${nodeId}</div>
-                        <div class="node-value">${temp.toFixed(1)}°C | ${humid.toFixed(0)}%</div>
-                    </div>
-                    <div style="font-size: 11px; color: #999;">
-                        ${nodeData.received_at?.toDate?.()?.toLocaleTimeString?.() || 'N/A'}
-                    </div>
+            section.innerHTML = '';
+            Object.entries(latest).forEach(([nodeId, entry]) => {
+                const env = entry.payload.environment || {};
+                const temp = env.temperature ?? 0;
+                const humid = env.humidity ?? 0;
+                const elev = env.elevation ?? env.barometric_pressure ?? 0;
+                const severity = temp > 35 ? 'danger' : temp > 30 ? 'warning' : 'online';
+                const card = document.createElement('div');
+                card.className = 'status-card';
+                card.innerHTML = `
+                    <strong>${nodeId}</strong>
+                    <span>${temp.toFixed(1)}°C · ${humid.toFixed(0)}% · ${elev.toFixed(0)} m</span>
+                    <small>Last seen ${formatTime(entry.payload.received_at)}</small>
+                    <div style="margin-top: 10px;"><span class="status-pill ${severity === 'online' ? 'pill-online' : severity === 'warning' ? 'pill-warning' : 'pill-danger'}">${severity === 'online' ? 'Normal' : severity === 'warning' ? 'Warning' : 'Danger'}</span></div>
                 `;
-                container.appendChild(item);
+                section.appendChild(card);
             });
         }
 
-        // Update device status section
-        function updateDeviceStatus(data) {
-            const container = document.getElementById('deviceStatus');
-            if (data.length === 0) {
-                container.innerHTML = '<div style="text-align: center; color: #999;">No devices online</div>';
+        function updateDeviceStatus(rows) {
+            const section = document.getElementById('deviceStatus');
+            if (!rows.length) {
+                section.innerHTML = '<div class="empty-state">No device status available.</div>';
                 return;
             }
-
-            const devices = {};
-            data.forEach(doc => {
-                const d = doc.data();
-                const nodeId = d.node_id || 'Unknown';
-                const timestamp = d.received_at?.toDate?.()?.getTime?.() || 0;
-                
-                if (!devices[nodeId] || timestamp > (devices[nodeId].timestamp || 0)) {
-                    devices[nodeId] = { ...d, timestamp };
-                }
+            const latest = {};
+            rows.forEach(doc => {
+                const payload = doc.data();
+                const nodeId = payload.node_id || 'Unknown';
+                const time = payload.received_at?.toDate?.()?.getTime?.() || 0;
+                if (!latest[nodeId] || time > latest[nodeId].time) latest[nodeId] = { payload, time };
             });
-
-            container.innerHTML = '';
             const now = Date.now();
-            Object.entries(devices).forEach(([nodeId, deviceData]) => {
-                const lastUpdate = deviceData.timestamp || 0;
-                const timeSinceUpdate = (now - lastUpdate) / 1000;
-                let statusClass = 'online';
-                let statusText = 'Online';
-
-                if (timeSinceUpdate > 300) {
-                    statusClass = 'offline';
-                    statusText = 'Offline';
-                } else if (deviceData.environment?.temperature > 35) {
-                    statusClass = 'warning';
-                    statusText = 'Warning';
-                }
-
-                const item = document.createElement('div');
-                item.className = 'device-item';
-                item.innerHTML = `
-                    <div class="device-status ${statusClass}"></div>
-                    <div style="flex: 1;">
-                        <strong>${nodeId}</strong>
-                    </div>
-                    <span class="log-status ${statusClass}">${statusText}</span>
+            section.innerHTML = '';
+            Object.entries(latest).forEach(([nodeId, entry]) => {
+                const payload = entry.payload;
+                const elapsed = Math.round((now - entry.time) / 1000);
+                let status = 'Online';
+                let pill = 'pill-online';
+                if (elapsed > 300) { status = 'Offline'; pill = 'pill-danger'; }
+                else if (payload.environment?.temperature > 35) { status = 'Warning'; pill = 'pill-warning'; }
+                const card = document.createElement('div');
+                card.className = 'status-card';
+                card.innerHTML = `
+                    <strong>${nodeId}</strong>
+                    <span>Last update ${elapsed}s ago · Attempts: ${payload.transmission_attempts ?? 'N/A'}</span>
+                    <small>${formatTime(payload.received_at)}</small>
+                    <div style="margin-top: 10px;"><span class="status-pill ${pill}">${status}</span></div>
                 `;
-                container.appendChild(item);
+                section.appendChild(card);
             });
         }
 
-        // Update health log section
-        function updateHealthLog(data) {
-            const container = document.getElementById('healthLog');
-            
-            if (data.length === 0) {
-                container.innerHTML = '<div style="text-align: center; color: #999;">No events logged</div>';
+        function updateHealthLog(rows) {
+            const section = document.getElementById('healthLog');
+            if (!rows.length) {
+                section.innerHTML = '<div class="empty-state">No health events yet.</div>';
                 return;
             }
-
-            // Generate events from data
-            const recentEvents = [];
-            data.slice(0, Math.min(20, data.length)).forEach(doc => {
-                const d = doc.data();
-                const temp = d.environment?.temperature ?? 0;
-                const humid = d.environment?.humidity ?? 0;
-                
-                let eventType = 'info';
-                let message = `${d.node_id || 'Unknown'}: Temperature ${temp.toFixed(1)}°C, Humidity ${humid.toFixed(0)}%`;
-                
-                if (temp > 35) {
-                    eventType = 'danger';
-                    message = `🔥 DANGER: ${d.node_id || 'Unknown'} - High temperature: ${temp.toFixed(1)}°C`;
-                } else if (temp > 30) {
-                    eventType = 'warning';
-                    message = `⚠️ WARNING: ${d.node_id || 'Unknown'} - Temperature ${temp.toFixed(1)}°C`;
-                }
-
-                recentEvents.push({
-                    type: eventType,
-                    message,
-                    time: d.received_at?.toDate?.()?.toLocaleTimeString?.() || 'N/A'
-                });
-            });
-
-            container.innerHTML = '';
-            recentEvents.forEach(event => {
-                const item = document.createElement('div');
-                item.className = `log-item ${event.type}`;
-                item.innerHTML = `
-                    <div class="log-time">${event.time}</div>
-                    <div class="log-message">${event.message}</div>
+            section.innerHTML = '';
+            rows.slice(0, 20).forEach(doc => {
+                const payload = doc.data();
+                const temp = payload.environment?.temperature ?? 0;
+                const humid = payload.environment?.humidity ?? 0;
+                let level = 'Normal';
+                let pill = 'pill-online';
+                if (temp > 35) { level = 'Danger'; pill = 'pill-danger'; }
+                else if (temp > 30) { level = 'Warning'; pill = 'pill-warning'; }
+                const card = document.createElement('div');
+                card.className = 'log-card';
+                card.innerHTML = `
+                    <strong>${formatTime(payload.received_at)} · ${payload.node_id || 'Unknown'}</strong>
+                    <span>${level}: ${temp.toFixed(1)}°C, ${humid.toFixed(0)}% humidity</span>
+                    <small>Transmission attempts: ${payload.transmission_attempts ?? 'N/A'}</small>
+                    <div style="margin-top: 10px;"><span class="status-pill ${pill}">${level}</span></div>
                 `;
-                container.appendChild(item);
+                section.appendChild(card);
             });
         }
 
-        // Update connection status
-        function updateConnectionStatus(connected) {
-            const statusDot = document.getElementById('connectionStatus');
-            const statusText = document.getElementById('connectionText');
-            if (connected) {
-                statusDot.className = 'status-dot';
-                statusText.textContent = 'Connected to Firebase';
-            } else {
-                statusDot.className = 'status-dot disconnected';
-                statusText.textContent = 'Disconnected from Firebase';
+        function updateTranscriptionLog(rows) {
+            const section = document.getElementById('transcriptionLog');
+            const hits = rows.filter(doc => doc.data().transcription || doc.data().speech_text);
+            if (!hits.length) {
+                section.innerHTML = '<div class="empty-state">No transcription or audio alerts found.</div>';
+                return;
             }
+            section.innerHTML = '';
+            hits.slice(0, 12).forEach(doc => {
+                const payload = doc.data();
+                const text = payload.transcription || payload.speech_text || 'No text available';
+                const card = document.createElement('div');
+                card.className = 'log-card';
+                card.innerHTML = `
+                    <strong>${payload.node_id || 'Unknown'}</strong>
+                    <span>${text}</span>
+                    <small>${formatTime(payload.received_at)}</small>
+                `;
+                section.appendChild(card);
+            });
         }
 
-        // Load real-time data from Firestore
+        function computeAlertRows(rows) {
+            const alerts = [];
+            rows.forEach(doc => {
+                const payload = doc.data();
+                const temp = payload.environment?.temperature;
+                if (typeof temp === 'number') {
+                    if (temp > 80) {
+                        alerts.push({ level: 'danger', message: `${payload.node_id || 'Unknown'} audio/warning: temperature above 80°C` });
+                    } else if (temp > 35) {
+                        alerts.push({ level: 'warning', message: `${payload.node_id || 'Unknown'} temperature high: ${temp.toFixed(1)}°C` });
+                    }
+                }
+            });
+            return alerts;
+        }
+
+        function renderAlertBanner(rows) {
+            const banner = document.getElementById('alertBanner');
+            const alerts = computeAlertRows(rows);
+            if (!alerts.length) {
+                banner.className = 'alert-banner normal';
+                banner.textContent = 'No active alerts. System normal.';
+                return;
+            }
+            const highest = alerts.find(alert => alert.level === 'danger') || alerts[0];
+            banner.className = `alert-banner ${highest.level}`;
+            banner.textContent = highest.message;
+        }
+
         function loadData() {
-            db.collection('iot-data')
-                .orderBy('received_at', 'desc')
-                .limit(100)
-                .onSnapshot((querySnapshot) => {
-                    updateConnectionStatus(true);
-                    const data = [];
-                    querySnapshot.forEach((doc) => {
-                        data.push(doc);
-                    });
-                    
-                    updateMiniCharts(data);
-                    updateEnvironmentStatus(data);
-                    updateDeviceStatus(data);
-                    updateHealthLog(data);
-                }, (error) => {
-                    console.error('Error loading data:', error);
-                    updateConnectionStatus(false);
-                    document.getElementById('environmentStatus').innerHTML = '<div style="text-align: center; color: #f44336;">Error loading data</div>';
-                });
+            db.collection('iot-data').orderBy('received_at', 'desc').limit(100).onSnapshot(snapshot => {
+                updateConnection(true);
+                const rows = [];
+                snapshot.forEach(doc => rows.push(doc));
+                updateMiniStats(rows);
+                updateEnvironmentStatus(rows);
+                updateDeviceStatus(rows);
+                updateHealthLog(rows);
+                updateTranscriptionLog(rows);
+                renderAlertBanner(rows);
+            }, error => {
+                console.error('Firestore error', error);
+                updateConnection(false);
+                document.getElementById('environmentStatus').innerHTML = '<div class="empty-state">Unable to load environment data.</div>';
+                document.getElementById('deviceStatus').innerHTML = '<div class="empty-state">Unable to load device status.</div>';
+                document.getElementById('healthLog').innerHTML = '<div class="empty-state">Unable to load health log.</div>';
+                document.getElementById('transcriptionLog').innerHTML = '<div class="empty-state">Unable to load transcription log.</div>';
+            });
         }
 
-        // Initialize dashboard
         initMiniCharts();
         loadData();
     </script>
