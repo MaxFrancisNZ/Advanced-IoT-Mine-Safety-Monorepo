@@ -11,6 +11,8 @@
 #include "freertos/task.h"
 
 #include "nvs_flash.h"
+#include "nvs.h"
+#include "driver/gpio.h"
 #include "esp_log.h"
 #include "esp_mac.h"
 #include "esp_spiffs.h"
@@ -83,6 +85,17 @@ static uint32_t s_next_sensor_seq = 0;
 static uint32_t s_next_audio_seq = 0;
 static uint32_t s_sensor_sample_sequence = 0;
 
+static volatile bool       s_time_synced     = false;
+static volatile int64_t    s_sync_epoch_ms   = 0;
+static volatile TickType_t s_sync_local_tick = 0;
+static portMUX_TYPE        s_time_sync_mux   = portMUX_INITIALIZER_UNLOCKED;
+
+static volatile bool s_offline_mode = false;
+
+#define OFFLINE_MAX_AUDIO_RECORDINGS 5U
+#define OFFLINE_NVS_NAMESPACE "wearable"
+#define OFFLINE_NVS_KEY       "offline"
+
 typedef enum {
     QUEUE_KIND_SENSOR = 0,
     QUEUE_KIND_AUDIO,
@@ -101,16 +114,24 @@ static void refresh_battery_probe(void);
 static void send_audio_chunks(const uint8_t *adpcm_data, size_t adpcm_len, uint32_t total_samples);
 static void handle_base_station_message(const uint8_t *mac_addr, const uint8_t *data, int len, void *context);
 static bool matches_json_field(const char *json, const char *field_name, const char *field_value);
+static bool parse_json_int64_field(const char *json, const char *field_name, int64_t *out_value);
+static bool get_synced_epoch_ms(int64_t *out_ms);
 static void normalize_json_string(const uint8_t *data, int len, char *buffer, size_t buffer_len);
 static const char *queue_kind_prefix(queue_kind_t kind);
 static uint32_t *queue_kind_next_seq(queue_kind_t kind);
 static esp_err_t init_persistent_queue(void);
 static esp_err_t refresh_queue_sequence_counters(void);
-static esp_err_t clear_persistent_queue_files(void);
 static esp_err_t enqueue_packet(queue_kind_t kind, const uint8_t *data, size_t len);
 static bool find_oldest_packet_path(queue_kind_t kind, char *path, size_t path_len, uint32_t *out_seq);
 static size_t count_queued_packets(queue_kind_t kind);
 static bool flush_persistent_queues(uint32_t *failed_transmission_attempts);
+static bool nvs_load_offline_flag(void);
+static void nvs_store_offline_flag(bool offline);
+static void button_gpio_init(void);
+static bool button_held_at_boot(void);
+static bool probe_basestation_for(uint32_t timeout_ms);
+static size_t count_queued_audio_recordings(void);
+static esp_err_t drop_oldest_audio_recording(void);
 
 static void log_sensor_error(const char *sensor_name, esp_err_t err)
 {
@@ -171,11 +192,6 @@ static esp_err_t init_persistent_queue(void)
         ESP_LOGW(TAG, "Failed to query queue storage usage: %s", esp_err_to_name(err));
     }
 
-    err = clear_persistent_queue_files();
-    if (err != ESP_OK) {
-        return err;
-    }
-
     return refresh_queue_sequence_counters();
 }
 
@@ -219,47 +235,6 @@ static esp_err_t refresh_queue_sequence_counters(void)
     ESP_LOGI(TAG, "Recovered queued packets: %u audio, %u sensor",
              (unsigned)count_queued_packets(QUEUE_KIND_AUDIO),
              (unsigned)count_queued_packets(QUEUE_KIND_SENSOR));
-    return ESP_OK;
-}
-
-static esp_err_t clear_persistent_queue_files(void)
-{
-    DIR *dir = opendir(STORAGE_SCAN_PATH);
-    struct dirent *entry = NULL;
-    char path[STORAGE_PATH_MAX];
-    size_t cleared_count = 0U;
-
-    if (dir == NULL) {
-        ESP_LOGE(TAG, "Failed to open queue storage for cleanup: errno=%d", errno);
-        return ESP_FAIL;
-    }
-
-    while ((entry = readdir(dir)) != NULL) {
-        uint32_t seq = 0;
-        const char *prefix = NULL;
-
-        if (sscanf(entry->d_name, "sensor_%" SCNu32 ".bin", &seq) == 1) {
-            prefix = queue_kind_prefix(QUEUE_KIND_SENSOR);
-        } else if (sscanf(entry->d_name, "audio_%" SCNu32 ".bin", &seq) == 1) {
-            prefix = queue_kind_prefix(QUEUE_KIND_AUDIO);
-        } else {
-            continue;
-        }
-
-        snprintf(path, sizeof(path), STORAGE_BASE_PATH "/%s%" PRIu32 ".bin", prefix, seq);
-        if (unlink(path) != 0) {
-            closedir(dir);
-            ESP_LOGE(TAG, "Failed to clear queued packet %s: errno=%d", path, errno);
-            return ESP_FAIL;
-        }
-
-        cleared_count++;
-    }
-
-    closedir(dir);
-    s_next_sensor_seq = 0U;
-    s_next_audio_seq = 0U;
-    ESP_LOGI(TAG, "Cleared %u queued packet file(s) at startup", (unsigned)cleared_count);
     return ESP_OK;
 }
 
@@ -463,6 +438,56 @@ static bool matches_json_field(const char *json, const char *field_name, const c
     return strstr(json, token) != NULL;
 }
 
+static bool parse_json_int64_field(const char *json, const char *field_name, int64_t *out_value)
+{
+    char token[40];
+    if (json == NULL || field_name == NULL || out_value == NULL) {
+        return false;
+    }
+
+    snprintf(token, sizeof(token), "\"%s\":", field_name);
+    const char *cursor = strstr(json, token);
+    if (cursor == NULL) {
+        return false;
+    }
+
+    cursor += strlen(token);
+    while (*cursor == ' ' || *cursor == '\t') {
+        cursor++;
+    }
+
+    char *end = NULL;
+    long long parsed = strtoll(cursor, &end, 10);
+    if (end == cursor) {
+        return false;
+    }
+
+    *out_value = (int64_t)parsed;
+    return true;
+}
+
+static bool get_synced_epoch_ms(int64_t *out_ms)
+{
+    bool synced;
+    int64_t base;
+    TickType_t base_tick;
+
+    portENTER_CRITICAL(&s_time_sync_mux);
+    synced = s_time_synced;
+    base = s_sync_epoch_ms;
+    base_tick = s_sync_local_tick;
+    portEXIT_CRITICAL(&s_time_sync_mux);
+
+    if (!synced) {
+        return false;
+    }
+
+    TickType_t now = xTaskGetTickCount();
+    int64_t elapsed_ms = (int64_t)((uint32_t)(now - base_tick)) * (int64_t)portTICK_PERIOD_MS;
+    *out_ms = base + elapsed_ms;
+    return true;
+}
+
 static void handle_base_station_message(const uint8_t *mac_addr, const uint8_t *data, int len, void *context)
 {
     (void)context;
@@ -482,11 +507,31 @@ static void handle_base_station_message(const uint8_t *mac_addr, const uint8_t *
     }
 
     normalize_json_string(data, len, normalized_json, sizeof(normalized_json));
-    if (!matches_json_field(normalized_json, "type", "led_override")) {
+
+    if (matches_json_field(normalized_json, "type", "led_override")) {
+        ESP_LOGI(TAG, "Ignoring LED override command while WS2812 feature is disabled: %s", normalized_json);
         return;
     }
 
-    ESP_LOGI(TAG, "Ignoring LED override command while WS2812 feature is disabled: %s", normalized_json);
+    if (matches_json_field(normalized_json, "type", "time_sync")) {
+        int64_t epoch_ms = 0;
+        if (!parse_json_int64_field(normalized_json, "epoch_ms", &epoch_ms)) {
+            ESP_LOGW(TAG, "time_sync packet missing epoch_ms: %s", normalized_json);
+            return;
+        }
+
+        TickType_t local_tick = xTaskGetTickCount();
+        portENTER_CRITICAL(&s_time_sync_mux);
+        s_sync_epoch_ms = epoch_ms;
+        s_sync_local_tick = local_tick;
+        s_time_synced = true;
+        portEXIT_CRITICAL(&s_time_sync_mux);
+
+        ESP_LOGI(TAG, "Time sync received: epoch_ms=%lld", (long long)epoch_ms);
+        return;
+    }
+
+    ESP_LOGI(TAG, "Ignoring unknown base station message: %s", normalized_json);
 }
 
 static void format_optional_float(char *buffer, size_t buffer_len, bool has_value, float value, uint8_t decimals)
@@ -497,6 +542,167 @@ static void format_optional_float(char *buffer, size_t buffer_len, bool has_valu
     }
 
     snprintf(buffer, buffer_len, "%.*f", decimals, value);
+}
+
+static bool nvs_load_offline_flag(void)
+{
+    nvs_handle_t handle;
+    esp_err_t err = nvs_open(OFFLINE_NVS_NAMESPACE, NVS_READONLY, &handle);
+    if (err != ESP_OK) {
+        return false;
+    }
+
+    uint8_t value = 0;
+    err = nvs_get_u8(handle, OFFLINE_NVS_KEY, &value);
+    nvs_close(handle);
+    return err == ESP_OK && value != 0;
+}
+
+static void nvs_store_offline_flag(bool offline)
+{
+    nvs_handle_t handle;
+    esp_err_t err = nvs_open(OFFLINE_NVS_NAMESPACE, NVS_READWRITE, &handle);
+    if (err != ESP_OK) {
+        ESP_LOGW(TAG, "nvs_open(%s) failed: %s", OFFLINE_NVS_NAMESPACE, esp_err_to_name(err));
+        return;
+    }
+
+    err = nvs_set_u8(handle, OFFLINE_NVS_KEY, offline ? 1 : 0);
+    if (err == ESP_OK) {
+        err = nvs_commit(handle);
+    }
+    if (err != ESP_OK) {
+        ESP_LOGW(TAG, "Failed to persist offline flag: %s", esp_err_to_name(err));
+    }
+    nvs_close(handle);
+}
+
+static void button_gpio_init(void)
+{
+    gpio_set_direction(BUTTON_GPIO, GPIO_MODE_INPUT);
+    gpio_set_pull_mode(BUTTON_GPIO, GPIO_PULLUP_ONLY);
+}
+
+static bool button_held_at_boot(void)
+{
+    if (gpio_get_level(BUTTON_GPIO) != 0) {
+        return false;
+    }
+    vTaskDelay(pdMS_TO_TICKS(50));
+    return gpio_get_level(BUTTON_GPIO) == 0;
+}
+
+static bool probe_basestation_for(uint32_t timeout_ms)
+{
+    const uint8_t probe[1] = { PROBE_MSG_TYPE };
+    const uint32_t per_attempt_ms = 1000;
+    TickType_t deadline = xTaskGetTickCount() + pdMS_TO_TICKS(timeout_ms);
+
+    while ((int32_t)(deadline - xTaskGetTickCount()) > 0) {
+        bool delivered = false;
+        esp_err_t err = espnow_manager_send_and_wait(probe, sizeof(probe), per_attempt_ms, &delivered);
+        if (err == ESP_OK && delivered) {
+            return true;
+        }
+        vTaskDelay(pdMS_TO_TICKS(50));
+    }
+    return false;
+}
+
+static bool read_audio_chunk_header_from_path(const char *path, audio_chunk_header_t *out_hdr)
+{
+    FILE *f = fopen(path, "rb");
+    if (f == NULL) {
+        return false;
+    }
+    size_t read_bytes = fread(out_hdr, 1, sizeof(*out_hdr), f);
+    fclose(f);
+    return read_bytes == sizeof(*out_hdr);
+}
+
+static size_t count_queued_audio_recordings(void)
+{
+    DIR *dir = opendir(STORAGE_SCAN_PATH);
+    if (dir == NULL) {
+        return 0;
+    }
+
+    size_t recordings = 0;
+    struct dirent *entry = NULL;
+    char path[STORAGE_PATH_MAX];
+
+    while ((entry = readdir(dir)) != NULL) {
+        uint32_t seq = 0;
+        if (sscanf(entry->d_name, "audio_%" SCNu32 ".bin", &seq) != 1) {
+            continue;
+        }
+
+        snprintf(path, sizeof(path), STORAGE_BASE_PATH "/%s", entry->d_name);
+        audio_chunk_header_t hdr = {0};
+        if (!read_audio_chunk_header_from_path(path, &hdr)) {
+            continue;
+        }
+        if (hdr.msg_type == AUDIO_MSG_TYPE && hdr.seq_num == 0U) {
+            recordings++;
+        }
+    }
+
+    closedir(dir);
+    return recordings;
+}
+
+static esp_err_t drop_oldest_audio_recording(void)
+{
+    DIR *dir = opendir(STORAGE_SCAN_PATH);
+    if (dir == NULL) {
+        return ESP_FAIL;
+    }
+
+    uint32_t oldest_start_seq = UINT32_MAX;
+    uint16_t oldest_total_chunks = 0;
+    struct dirent *entry = NULL;
+    char path[STORAGE_PATH_MAX];
+
+    while ((entry = readdir(dir)) != NULL) {
+        uint32_t seq = 0;
+        if (sscanf(entry->d_name, "audio_%" SCNu32 ".bin", &seq) != 1) {
+            continue;
+        }
+
+        snprintf(path, sizeof(path), STORAGE_BASE_PATH "/%s", entry->d_name);
+        audio_chunk_header_t hdr = {0};
+        if (!read_audio_chunk_header_from_path(path, &hdr)) {
+            continue;
+        }
+        if (hdr.msg_type != AUDIO_MSG_TYPE || hdr.seq_num != 0U) {
+            continue;
+        }
+        if (seq < oldest_start_seq) {
+            oldest_start_seq = seq;
+            oldest_total_chunks = hdr.total_chunks;
+        }
+    }
+    closedir(dir);
+
+    if (oldest_start_seq == UINT32_MAX || oldest_total_chunks == 0U) {
+        return ESP_ERR_NOT_FOUND;
+    }
+
+    size_t deleted = 0;
+    for (uint16_t i = 0; i < oldest_total_chunks; i++) {
+        snprintf(path, sizeof(path), STORAGE_BASE_PATH "/audio_%" PRIu32 ".bin",
+                 oldest_start_seq + (uint32_t)i);
+        if (unlink(path) == 0) {
+            deleted++;
+        } else if (errno != ENOENT) {
+            ESP_LOGW(TAG, "Failed to drop %s: errno=%d", path, errno);
+        }
+    }
+
+    ESP_LOGI(TAG, "Dropped oldest audio recording: start_seq=%" PRIu32
+                  ", expected_chunks=%u, removed=%u",
+             oldest_start_seq, (unsigned)oldest_total_chunks, (unsigned)deleted);
+    return ESP_OK;
 }
 
 static void initialize_sensors(void)
@@ -581,6 +787,15 @@ static void format_payload(char *json, size_t json_len, uint32_t transmission_at
     char gyro_z[16];
     char pressure[16];
     char battery_voltage[16];
+    char measurement_epoch_str[24];
+
+    int64_t measurement_epoch_ms = 0;
+    if (get_synced_epoch_ms(&measurement_epoch_ms)) {
+        snprintf(measurement_epoch_str, sizeof(measurement_epoch_str),
+                 "%lld", (long long)measurement_epoch_ms);
+    } else {
+        snprintf(measurement_epoch_str, sizeof(measurement_epoch_str), "null");
+    }
 
     initialize_sensors();
     refresh_battery_probe();
@@ -634,6 +849,7 @@ static void format_payload(char *json, size_t json_len, uint32_t transmission_at
              "\"node_id\":\"%s\","
              "\"sample_sequence\":%" PRIu32 ","
              "\"transmission_attempts\":%" PRIu32 ","
+             "\"measurement_epoch_ms\":%s,"
              "\"environment\":{"
              "\"battery_voltage\":%s,"
              "\"temperature\":%s,"
@@ -648,6 +864,7 @@ static void format_payload(char *json, size_t json_len, uint32_t transmission_at
              node_id,
              sample_sequence,
              transmission_attempts,
+             measurement_epoch_str,
              battery_voltage,
              temperature,
              humidity,
@@ -701,7 +918,10 @@ static void send_audio_chunks(const uint8_t *adpcm_data, size_t adpcm_len, uint3
         vTaskDelay(pdMS_TO_TICKS(5));
     }
 
-    if (!flush_persistent_queues(NULL)) {
+    if (s_offline_mode) {
+        ESP_LOGI(TAG, "Audio recording stored offline (%u audio pending)",
+                 (unsigned)count_queued_packets(QUEUE_KIND_AUDIO));
+    } else if (!flush_persistent_queues(NULL)) {
         ESP_LOGW(TAG, "Audio queued for later delivery (%u audio pending)",
                  (unsigned)count_queued_packets(QUEUE_KIND_AUDIO));
     } else {
@@ -713,9 +933,6 @@ static void send_audio_chunks(const uint8_t *adpcm_data, size_t adpcm_len, uint3
 static void button_task(void *pvParameters)
 {
     (void)pvParameters;
-
-    gpio_set_direction(BUTTON_GPIO, GPIO_MODE_INPUT);
-    gpio_set_pull_mode(BUTTON_GPIO, GPIO_PULLUP_ONLY);
 
     int16_t read_buf[MIC_READ_CHUNK];
 
@@ -729,6 +946,14 @@ static void button_task(void *pvParameters)
         /* Debounce */
         vTaskDelay(pdMS_TO_TICKS(50));
         if (gpio_get_level(BUTTON_GPIO) != 0) continue;
+
+        while (count_queued_audio_recordings() >= OFFLINE_MAX_AUDIO_RECORDINGS) {
+            ESP_LOGW(TAG, "Audio queue at cap (%u recordings); dropping oldest",
+                     (unsigned)OFFLINE_MAX_AUDIO_RECORDINGS);
+            if (drop_oldest_audio_recording() != ESP_OK) {
+                break;
+            }
+        }
 
         /* --- Begin recording --- */
         audio_active = true;
@@ -826,14 +1051,15 @@ static void send_task(void *pvParameters)
             next_measurement_tick = now + pdMS_TO_TICKS(SEND_INTERVAL_MS);
         }
 
-        if (has_pending_packets &&
+        if (!s_offline_mode && has_pending_packets &&
             (count_queued_packets(QUEUE_KIND_SENSOR) > 1U || count_queued_packets(QUEUE_KIND_AUDIO) > 0U || measurement_due)) {
             ESP_LOGI(TAG, "Queued payloads pending (%u audio, %u sensor)",
                      (unsigned)count_queued_packets(QUEUE_KIND_AUDIO),
                      (unsigned)count_queued_packets(QUEUE_KIND_SENSOR));
         }
 
-        if (has_pending_packets && !flush_persistent_queues(&failed_transmission_attempts)) {
+        if (!s_offline_mode && has_pending_packets &&
+            !flush_persistent_queues(&failed_transmission_attempts)) {
             ESP_LOGI(TAG, "Queue flush paused with %u audio and %u sensor payload(s) pending",
                      (unsigned)count_queued_packets(QUEUE_KIND_AUDIO),
                      (unsigned)count_queued_packets(QUEUE_KIND_SENSOR));
@@ -939,6 +1165,25 @@ void app_main(void)
     }
 
     ESP_LOGI(TAG, "WS2812/status LED feature disabled in firmware");
+
+    button_gpio_init();
+    s_offline_mode = nvs_load_offline_flag();
+
+    if (button_held_at_boot()) {
+        ESP_LOGI(TAG, "Boot button held — probing basestation for up to 10s");
+        bool reachable = probe_basestation_for(10000);
+        s_offline_mode = !reachable;
+        nvs_store_offline_flag(s_offline_mode);
+        ESP_LOGI(TAG, "Boot decision: %s",
+                 s_offline_mode ? "OFFLINE (no basestation ack)" : "ONLINE (basestation reachable)");
+    } else {
+        ESP_LOGI(TAG, "Boot decision (button not held): %s",
+                 s_offline_mode ? "OFFLINE (resumed)" : "ONLINE");
+    }
+
+    ESP_LOGI(TAG, "Queued at startup: %u audio chunk(s), %u sensor payload(s)",
+             (unsigned)count_queued_packets(QUEUE_KIND_AUDIO),
+             (unsigned)count_queued_packets(QUEUE_KIND_SENSOR));
 
     xTaskCreate(send_task, "send_task", 4096, NULL, 4, NULL);
     xTaskCreate(button_task, "button_task", 8192, NULL, 5, NULL);

@@ -11,6 +11,7 @@
  */
 
 #define AUDIO_MSG_TYPE        0x02
+#define PROBE_MSG_TYPE        0x03
 #define ESPNOW_MAX_PAYLOAD    1470   /* ESP-NOW v2.0 max (ESP_NOW_MAX_DATA_LEN_V2) */
 #define AUDIO_CHUNK_HDR_SIZE  19     /* sizeof(audio_chunk_header_t) */
 #define AUDIO_CHUNK_DATA_MAX  (ESPNOW_MAX_PAYLOAD - AUDIO_CHUNK_HDR_SIZE)  /* 1451 */
