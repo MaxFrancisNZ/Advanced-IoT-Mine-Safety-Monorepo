@@ -13,9 +13,12 @@
 #include "nvs_flash.h"
 #include "nvs.h"
 #include "driver/gpio.h"
+#include "esp_event.h"
 #include "esp_log.h"
 #include "esp_mac.h"
+#include "esp_netif.h"
 #include "esp_spiffs.h"
+#include "esp_wifi.h"
 
 #include "i2c_manager.h"
 #include "espnow_manager.h"
@@ -57,11 +60,15 @@
 #define AUDIO_MAX_SECONDS    5
 #define AUDIO_MAX_SAMPLES    (AUDIO_SAMPLE_RATE * AUDIO_MAX_SECONDS)
 #define MIC_READ_CHUNK       512
+#define BUTTON_DEBOUNCE_MS   50
 #define JSON_PAYLOAD_MAX_LEN 512
 #define STORAGE_BASE_PATH    "/spiffs"
 #define STORAGE_SCAN_PATH    STORAGE_BASE_PATH "/"
 #define STORAGE_PATH_MAX     96
 #define STORAGE_READ_BUFFER_MAX ESPNOW_MAX_PAYLOAD
+#define AUDIO_QUEUE_FLUSH_DELAY_MS 5
+#define AUDIO_SEND_TIMEOUT_MS 100
+#define SENSOR_SEND_TIMEOUT_MS 500
 #define QUEUE_FLUSH_DELAY_MS 50
 #define QUEUE_RETRY_DELAY_MS 250
 
@@ -84,6 +91,8 @@ static uint8_t base_station_mac[6] = {0};
 static uint32_t s_next_sensor_seq = 0;
 static uint32_t s_next_audio_seq = 0;
 static uint32_t s_sensor_sample_sequence = 0;
+static bool s_diagnostic_mode = false;
+static volatile TickType_t s_sensor_resume_tick = 0;
 
 static volatile bool       s_time_synced     = false;
 static volatile int64_t    s_sync_epoch_ms   = 0;
@@ -124,10 +133,13 @@ static esp_err_t refresh_queue_sequence_counters(void);
 static esp_err_t enqueue_packet(queue_kind_t kind, const uint8_t *data, size_t len);
 static bool find_oldest_packet_path(queue_kind_t kind, char *path, size_t path_len, uint32_t *out_seq);
 static size_t count_queued_packets(queue_kind_t kind);
+static bool flush_next_queued_packet(uint32_t *failed_transmission_attempts);
 static bool flush_persistent_queues(uint32_t *failed_transmission_attempts);
 static bool nvs_load_offline_flag(void);
 static void nvs_store_offline_flag(bool offline);
 static void button_gpio_init(void);
+static bool button_pressed(void);
+static bool build_storage_entry_path(char *path, size_t path_len, const char *entry_name);
 static bool button_held_at_boot(void);
 static bool probe_basestation_for(uint32_t timeout_ms);
 static size_t count_queued_audio_recordings(void);
@@ -343,88 +355,116 @@ static size_t count_queued_packets(queue_kind_t kind)
     return count;
 }
 
-static bool flush_persistent_queues(uint32_t *failed_transmission_attempts)
+static bool flush_next_queued_packet(uint32_t *failed_transmission_attempts)
 {
     uint8_t packet_buffer[STORAGE_READ_BUFFER_MAX];
+    queue_kind_t kind = QUEUE_KIND_AUDIO;
+    char path[STORAGE_PATH_MAX];
+    uint32_t seq = 0;
+    FILE *file = NULL;
+    size_t payload_len = 0;
+    bool delivered = false;
+    esp_err_t err = ESP_OK;
+    uint32_t send_timeout_ms = SENSOR_SEND_TIMEOUT_MS;
 
-    while (true) {
-        queue_kind_t kind = QUEUE_KIND_AUDIO;
-        char path[STORAGE_PATH_MAX];
-        uint32_t seq = 0;
-        FILE *file = NULL;
-        size_t payload_len = 0;
-        bool delivered = false;
-        esp_err_t err = ESP_OK;
+    if (audio_active) {
+        return false;
+    }
 
-        if (!find_oldest_packet_path(QUEUE_KIND_AUDIO, path, sizeof(path), &seq)) {
-            kind = QUEUE_KIND_SENSOR;
-            if (!find_oldest_packet_path(kind, path, sizeof(path), &seq)) {
-                return true;
-            }
+    if (!find_oldest_packet_path(QUEUE_KIND_AUDIO, path, sizeof(path), &seq)) {
+        kind = QUEUE_KIND_SENSOR;
+        if (!find_oldest_packet_path(kind, path, sizeof(path), &seq)) {
+            return true;
         }
+    }
 
-        file = fopen(path, "rb");
-        if (file == NULL) {
-            ESP_LOGW(TAG, "Queued packet disappeared before send: %s", path);
-            continue;
-        }
+    file = fopen(path, "rb");
+    if (file == NULL) {
+        ESP_LOGW(TAG, "Queued packet disappeared before send: %s", path);
+        return true;
+    }
 
-        payload_len = fread(packet_buffer, 1, sizeof(packet_buffer), file);
-        if (ferror(file) != 0) {
-            ESP_LOGE(TAG, "Failed reading queued packet %s", path);
-            fclose(file);
-            if (failed_transmission_attempts != NULL) {
-                (*failed_transmission_attempts)++;
-            }
-            return false;
-        }
+    payload_len = fread(packet_buffer, 1, sizeof(packet_buffer), file);
+    if (ferror(file) != 0) {
+        ESP_LOGE(TAG, "Failed reading queued packet %s", path);
         fclose(file);
-
-        if (payload_len == 0U) {
-            ESP_LOGW(TAG, "Removing empty queued packet %s", path);
-            unlink(path);
-            continue;
-        }
-
-        err = espnow_manager_send_and_wait(packet_buffer, payload_len, 1000, &delivered);
-        if (err != ESP_OK) {
-            ESP_LOGE(TAG, "espnow_manager_send failed while flushing %s queue: %s",
-                     kind == QUEUE_KIND_AUDIO ? "audio" : "sensor",
-                     esp_err_to_name(err));
-            if (failed_transmission_attempts != NULL) {
-                (*failed_transmission_attempts)++;
-            }
-            return false;
-        }
-
-        if (!delivered) {
-            ESP_LOGW(TAG, "ESP-NOW delivery failed while flushing %s queue",
-                     kind == QUEUE_KIND_AUDIO ? "audio" : "sensor");
-            if (failed_transmission_attempts != NULL) {
-                (*failed_transmission_attempts)++;
-            }
-            return false;
-        }
-
-        if (unlink(path) != 0) {
-            ESP_LOGE(TAG, "Failed to delete sent queue file %s: errno=%d", path, errno);
-            if (failed_transmission_attempts != NULL) {
-                (*failed_transmission_attempts)++;
-            }
-            return false;
-        }
-
-        ESP_LOGI(TAG, "Sent queued %s packet %" PRIu32 " (%u bytes, %u audio pending, %u sensor pending)",
-                 kind == QUEUE_KIND_AUDIO ? "audio" : "sensor",
-                 seq,
-                 (unsigned)payload_len,
-                 (unsigned)count_queued_packets(QUEUE_KIND_AUDIO),
-                 (unsigned)count_queued_packets(QUEUE_KIND_SENSOR));
         if (failed_transmission_attempts != NULL) {
-            *failed_transmission_attempts = 0;
+            (*failed_transmission_attempts)++;
+        }
+        return false;
+    }
+    fclose(file);
+
+    if (payload_len == 0U) {
+        ESP_LOGW(TAG, "Removing empty queued packet %s", path);
+        unlink(path);
+        return true;
+    }
+
+    if (audio_active) {
+        return false;
+    }
+
+    send_timeout_ms = (kind == QUEUE_KIND_AUDIO) ? AUDIO_SEND_TIMEOUT_MS : SENSOR_SEND_TIMEOUT_MS;
+    err = espnow_manager_send_and_wait(packet_buffer, payload_len, send_timeout_ms, &delivered);
+    if (err != ESP_OK) {
+        ESP_LOGE(TAG, "espnow_manager_send failed while flushing %s queue: %s",
+                 kind == QUEUE_KIND_AUDIO ? "audio" : "sensor",
+                 esp_err_to_name(err));
+        if (failed_transmission_attempts != NULL) {
+            (*failed_transmission_attempts)++;
+        }
+        return false;
+    }
+
+    if (!delivered) {
+        ESP_LOGW(TAG, "ESP-NOW delivery failed while flushing %s queue",
+                 kind == QUEUE_KIND_AUDIO ? "audio" : "sensor");
+        if (failed_transmission_attempts != NULL) {
+            (*failed_transmission_attempts)++;
+        }
+        return false;
+    }
+
+    if (unlink(path) != 0) {
+        ESP_LOGE(TAG, "Failed to delete sent queue file %s: errno=%d", path, errno);
+        if (failed_transmission_attempts != NULL) {
+            (*failed_transmission_attempts)++;
+        }
+        return false;
+    }
+
+    ESP_LOGI(TAG, "Sent queued %s packet %" PRIu32 " (%u bytes, %u audio pending, %u sensor pending)",
+             kind == QUEUE_KIND_AUDIO ? "audio" : "sensor",
+             seq,
+             (unsigned)payload_len,
+             (unsigned)count_queued_packets(QUEUE_KIND_AUDIO),
+             (unsigned)count_queued_packets(QUEUE_KIND_SENSOR));
+    if (failed_transmission_attempts != NULL) {
+        *failed_transmission_attempts = 0;
+    }
+
+    return true;
+}
+
+static bool flush_persistent_queues(uint32_t *failed_transmission_attempts)
+{
+    while (true) {
+        bool queue_had_packets = count_queued_packets(QUEUE_KIND_AUDIO) > 0U ||
+                                 count_queued_packets(QUEUE_KIND_SENSOR) > 0U;
+        if (!queue_had_packets) {
+            return true;
         }
 
-        vTaskDelay(pdMS_TO_TICKS(QUEUE_FLUSH_DELAY_MS));
+        queue_kind_t next_kind = count_queued_packets(QUEUE_KIND_AUDIO) > 0U ?
+                                 QUEUE_KIND_AUDIO : QUEUE_KIND_SENSOR;
+        if (!flush_next_queued_packet(failed_transmission_attempts)) {
+            return false;
+        }
+
+        vTaskDelay(pdMS_TO_TICKS(next_kind == QUEUE_KIND_AUDIO ?
+                                 AUDIO_QUEUE_FLUSH_DELAY_MS :
+                                 QUEUE_FLUSH_DELAY_MS));
     }
 
     return true;
@@ -583,13 +623,35 @@ static void button_gpio_init(void)
     gpio_set_pull_mode(BUTTON_GPIO, GPIO_PULLUP_ONLY);
 }
 
-static bool button_held_at_boot(void)
+static bool button_pressed(void)
 {
-    if (gpio_get_level(BUTTON_GPIO) != 0) {
+    return gpio_get_level(BUTTON_GPIO) == 0;
+}
+
+static bool build_storage_entry_path(char *path, size_t path_len, const char *entry_name)
+{
+    int written;
+
+    if (path == NULL || path_len == 0U || entry_name == NULL) {
         return false;
     }
-    vTaskDelay(pdMS_TO_TICKS(50));
-    return gpio_get_level(BUTTON_GPIO) == 0;
+
+    written = snprintf(path, path_len, STORAGE_BASE_PATH "/%s", entry_name);
+    if (written < 0 || (size_t)written >= path_len) {
+        ESP_LOGW(TAG, "Skipping overlong storage entry path: %s", entry_name);
+        return false;
+    }
+
+    return true;
+}
+
+static bool button_held_at_boot(void)
+{
+    if (!button_pressed()) {
+        return false;
+    }
+    vTaskDelay(pdMS_TO_TICKS(BUTTON_DEBOUNCE_MS));
+    return button_pressed();
 }
 
 static bool probe_basestation_for(uint32_t timeout_ms)
@@ -637,7 +699,9 @@ static size_t count_queued_audio_recordings(void)
             continue;
         }
 
-        snprintf(path, sizeof(path), STORAGE_BASE_PATH "/%s", entry->d_name);
+        if (!build_storage_entry_path(path, sizeof(path), entry->d_name)) {
+            continue;
+        }
         audio_chunk_header_t hdr = {0};
         if (!read_audio_chunk_header_from_path(path, &hdr)) {
             continue;
@@ -669,7 +733,9 @@ static esp_err_t drop_oldest_audio_recording(void)
             continue;
         }
 
-        snprintf(path, sizeof(path), STORAGE_BASE_PATH "/%s", entry->d_name);
+        if (!build_storage_entry_path(path, sizeof(path), entry->d_name)) {
+            continue;
+        }
         audio_chunk_header_t hdr = {0};
         if (!read_audio_chunk_header_from_path(path, &hdr)) {
             continue;
@@ -890,6 +956,14 @@ static void send_audio_chunks(const uint8_t *adpcm_data, size_t adpcm_len, uint3
     ESP_LOGI(TAG, "Sending audio: %zu bytes ADPCM, %"PRIu32" samples, %u chunks",
              adpcm_len, total_samples, total_chunks);
 
+    while (count_queued_audio_recordings() >= OFFLINE_MAX_AUDIO_RECORDINGS) {
+        ESP_LOGW(TAG, "Audio queue at cap (%u recordings); dropping oldest",
+                 (unsigned)OFFLINE_MAX_AUDIO_RECORDINGS);
+        if (drop_oldest_audio_recording() != ESP_OK) {
+            break;
+        }
+    }
+
     for (uint16_t i = 0; i < total_chunks; i++) {
         uint8_t pkt[ESPNOW_MAX_PAYLOAD];
         audio_chunk_header_t *hdr = (audio_chunk_header_t *)pkt;
@@ -934,83 +1008,110 @@ static void button_task(void *pvParameters)
 {
     (void)pvParameters;
 
+    bool was_pressed = false;
     int16_t read_buf[MIC_READ_CHUNK];
 
+    if (led_manager_set(false) != ESP_OK) {
+        ESP_LOGW(TAG, "Failed to force LED off at button task start");
+    }
+
     while (1) {
-        /* Wait for button press (active-low) */
-        if (gpio_get_level(BUTTON_GPIO) != 0) {
-            vTaskDelay(pdMS_TO_TICKS(50));
-            continue;
-        }
+        bool pressed = button_pressed();
+        if (pressed != was_pressed) {
+            vTaskDelay(pdMS_TO_TICKS(BUTTON_DEBOUNCE_MS));
+            pressed = button_pressed();
+            if (pressed != was_pressed) {
+                was_pressed = pressed;
+                audio_active = pressed;
+                if (led_manager_set(pressed) != ESP_OK) {
+                    ESP_LOGW(TAG, "Failed to set LED state for button event");
+                }
+                ESP_LOGI(TAG, "Button %s", pressed ? "pressed" : "released");
 
-        /* Debounce */
-        vTaskDelay(pdMS_TO_TICKS(50));
-        if (gpio_get_level(BUTTON_GPIO) != 0) continue;
+                if (pressed && s_diagnostic_mode) {
+                    size_t adpcm_buf_size = (AUDIO_MAX_SAMPLES + 1) / 2;
+                    uint8_t *adpcm_buf = malloc(adpcm_buf_size);
+                    size_t total_samples = 0;
+                    size_t adpcm_offset = 0;
+                    adpcm_state_t adpcm_state = {0, 0};
 
-        while (count_queued_audio_recordings() >= OFFLINE_MAX_AUDIO_RECORDINGS) {
-            ESP_LOGW(TAG, "Audio queue at cap (%u recordings); dropping oldest",
-                     (unsigned)OFFLINE_MAX_AUDIO_RECORDINGS);
-            if (drop_oldest_audio_recording() != ESP_OK) {
-                break;
+                    if (adpcm_buf == NULL) {
+                        ESP_LOGE(TAG, "Failed to allocate diagnostic ADPCM buffer (%zu bytes)", adpcm_buf_size);
+                        audio_active = false;
+                        was_pressed = false;
+                        if (led_manager_set(false) != ESP_OK) {
+                            ESP_LOGW(TAG, "Failed to clear LED after diagnostic audio allocation failure");
+                        }
+                        while (button_pressed()) {
+                            vTaskDelay(pdMS_TO_TICKS(10));
+                        }
+                        s_sensor_resume_tick = xTaskGetTickCount() + pdMS_TO_TICKS(SEND_INTERVAL_MS);
+                        continue;
+                    }
+
+                    esp_err_t err = mic_manager_start();
+                    if (err != ESP_OK) {
+                        ESP_LOGE(TAG, "Diagnostic mic start failed: %s", esp_err_to_name(err));
+                        free(adpcm_buf);
+                        audio_active = false;
+                        was_pressed = false;
+                        if (led_manager_set(false) != ESP_OK) {
+                            ESP_LOGW(TAG, "Failed to clear LED after diagnostic mic start failure");
+                        }
+                        while (button_pressed()) {
+                            vTaskDelay(pdMS_TO_TICKS(10));
+                        }
+                        s_sensor_resume_tick = xTaskGetTickCount() + pdMS_TO_TICKS(SEND_INTERVAL_MS);
+                    } else {
+                        ESP_LOGI(TAG, "Diagnostic audio capture started");
+
+                        while (button_pressed() && total_samples < AUDIO_MAX_SAMPLES) {
+                            size_t remaining = AUDIO_MAX_SAMPLES - total_samples;
+                            size_t to_read = remaining < MIC_READ_CHUNK ? remaining : MIC_READ_CHUNK;
+                            size_t samples_read = 0;
+
+                            err = mic_manager_read(read_buf, to_read, &samples_read, 250);
+                            if (err != ESP_OK) {
+                                ESP_LOGW(TAG, "Diagnostic mic read failed: %s", esp_err_to_name(err));
+                                continue;
+                            }
+
+                            size_t encoded = adpcm_encode(read_buf, samples_read,
+                                                          adpcm_buf + adpcm_offset, &adpcm_state);
+                            adpcm_offset += encoded;
+                            total_samples += samples_read;
+                        }
+
+                        err = mic_manager_stop();
+                        if (err != ESP_OK) {
+                            ESP_LOGW(TAG, "Diagnostic mic stop failed: %s", esp_err_to_name(err));
+                        }
+
+                        ESP_LOGI(TAG, "Diagnostic audio capture stopped: %zu samples (%.1f sec, %zu bytes ADPCM)",
+                                 total_samples, (float)total_samples / AUDIO_SAMPLE_RATE, adpcm_offset);
+
+                        if (total_samples > 0) {
+                            send_audio_chunks(adpcm_buf, adpcm_offset, (uint32_t)total_samples);
+                        }
+
+                        audio_active = false;
+                        was_pressed = false;
+                        if (led_manager_set(false) != ESP_OK) {
+                            ESP_LOGW(TAG, "Failed to clear LED after diagnostic mic capture");
+                        }
+                        while (button_pressed()) {
+                            vTaskDelay(pdMS_TO_TICKS(10));
+                        }
+                        s_sensor_resume_tick = xTaskGetTickCount() + pdMS_TO_TICKS(SEND_INTERVAL_MS);
+                        free(adpcm_buf);
+                    }
+                } else if (!pressed) {
+                    s_sensor_resume_tick = xTaskGetTickCount() + pdMS_TO_TICKS(SEND_INTERVAL_MS);
+                }
             }
         }
 
-        /* --- Begin recording --- */
-        audio_active = true;
-        ESP_LOGI(TAG, "Recording started (hold button, max %d sec)", AUDIO_MAX_SECONDS);
-
-        size_t adpcm_buf_size = (AUDIO_MAX_SAMPLES + 1) / 2;
-        uint8_t *adpcm_buf = malloc(adpcm_buf_size);
-        if (adpcm_buf == NULL) {
-            ESP_LOGE(TAG, "Failed to allocate ADPCM buffer (%zu bytes)", adpcm_buf_size);
-            audio_active = false;
-            continue;
-        }
-
-        adpcm_state_t adpcm_state = {0, 0};
-        size_t adpcm_offset = 0;
-        size_t total_samples = 0;
-
-        esp_err_t err = mic_manager_start();
-        if (err != ESP_OK) {
-            ESP_LOGE(TAG, "mic_manager_start failed: %s", esp_err_to_name(err));
-            free(adpcm_buf);
-            audio_active = false;
-            continue;
-        }
-
-        /* Record while button is held, up to max duration */
-        while (gpio_get_level(BUTTON_GPIO) == 0 && total_samples < AUDIO_MAX_SAMPLES) {
-            size_t remaining = AUDIO_MAX_SAMPLES - total_samples;
-            size_t to_read = remaining < MIC_READ_CHUNK ? remaining : MIC_READ_CHUNK;
-            size_t samples_read = 0;
-
-            err = mic_manager_read(read_buf, to_read, &samples_read, 500);
-            if (err != ESP_OK || samples_read == 0) continue;
-
-            size_t encoded = adpcm_encode(read_buf, samples_read,
-                                          adpcm_buf + adpcm_offset, &adpcm_state);
-            adpcm_offset += encoded;
-            total_samples += samples_read;
-        }
-
-        mic_manager_stop();
-
-        ESP_LOGI(TAG, "Recording stopped: %zu samples (%.1f sec)",
-                 total_samples, (float)total_samples / AUDIO_SAMPLE_RATE);
-
-        /* --- Send compressed audio --- */
-        if (total_samples > 0) {
-            send_audio_chunks(adpcm_buf, adpcm_offset, (uint32_t)total_samples);
-        }
-
-        free(adpcm_buf);
-        audio_active = false;
-
-        /* Wait for button release before allowing another recording */
-        while (gpio_get_level(BUTTON_GPIO) == 0) {
-            vTaskDelay(pdMS_TO_TICKS(50));
-        }
+        vTaskDelay(pdMS_TO_TICKS(10));
     }
 }
 
@@ -1027,15 +1128,69 @@ static void send_task(void *pvParameters)
     {
         TickType_t now = xTaskGetTickCount();
         bool measurement_due = now >= next_measurement_tick;
-        bool has_pending_packets = count_queued_packets(QUEUE_KIND_AUDIO) > 0U ||
-                                   count_queued_packets(QUEUE_KIND_SENSOR) > 0U;
+        TickType_t resume_tick = s_sensor_resume_tick;
+
+        if (resume_tick != 0 && (int32_t)(resume_tick - next_measurement_tick) > 0) {
+            next_measurement_tick = resume_tick;
+            measurement_due = now >= next_measurement_tick;
+        }
 
         if (audio_active) {
             vTaskDelay(pdMS_TO_TICKS(500));
             continue;
         }
 
+        if (s_diagnostic_mode) {
+            if (measurement_due) {
+                log_battery_probe();
+                format_payload(json, sizeof(json), failed_transmission_attempts, s_sensor_sample_sequence++);
+
+                size_t json_len = strlen(json);
+                if (enqueue_packet(QUEUE_KIND_SENSOR, (const uint8_t *)json, json_len) != ESP_OK) {
+                    failed_transmission_attempts++;
+                    next_measurement_tick = now + pdMS_TO_TICKS(SEND_INTERVAL_MS);
+                    vTaskDelay(pdMS_TO_TICKS(SEND_INTERVAL_MS));
+                    continue;
+                }
+
+                ESP_LOGI(TAG, "Diagnostic sensor sample queued: %s", json);
+                next_measurement_tick = now + pdMS_TO_TICKS(SEND_INTERVAL_MS);
+            }
+
+            bool has_pending_packets = count_queued_packets(QUEUE_KIND_AUDIO) > 0U ||
+                                       count_queued_packets(QUEUE_KIND_SENSOR) > 0U;
+
+            if (!s_offline_mode && has_pending_packets && !audio_active) {
+                if (!flush_next_queued_packet(&failed_transmission_attempts)) {
+                    ESP_LOGI(TAG, "Diagnostic queue send paused with %u audio and %u sensor payload(s) pending",
+                             (unsigned)count_queued_packets(QUEUE_KIND_AUDIO),
+                             (unsigned)count_queued_packets(QUEUE_KIND_SENSOR));
+                    vTaskDelay(pdMS_TO_TICKS(QUEUE_RETRY_DELAY_MS));
+                    continue;
+                }
+            }
+
+            now = xTaskGetTickCount();
+            if (now < next_measurement_tick) {
+                TickType_t sleep_ticks = next_measurement_tick - now;
+                TickType_t retry_ticks = pdMS_TO_TICKS(QUEUE_RETRY_DELAY_MS);
+                if (sleep_ticks > retry_ticks) {
+                    sleep_ticks = retry_ticks;
+                }
+                vTaskDelay(sleep_ticks);
+            }
+            continue;
+        }
+
+        bool has_pending_packets = count_queued_packets(QUEUE_KIND_AUDIO) > 0U ||
+                                   count_queued_packets(QUEUE_KIND_SENSOR) > 0U;
+
         if (measurement_due) {
+            if (audio_active) {
+                next_measurement_tick = xTaskGetTickCount() + pdMS_TO_TICKS(SEND_INTERVAL_MS);
+                continue;
+            }
+
             log_battery_probe();
             format_payload(json, sizeof(json), failed_transmission_attempts, s_sensor_sample_sequence++);
 
@@ -1056,6 +1211,11 @@ static void send_task(void *pvParameters)
             ESP_LOGI(TAG, "Queued payloads pending (%u audio, %u sensor)",
                      (unsigned)count_queued_packets(QUEUE_KIND_AUDIO),
                      (unsigned)count_queued_packets(QUEUE_KIND_SENSOR));
+        }
+
+        if (audio_active) {
+            vTaskDelay(pdMS_TO_TICKS(50));
+            continue;
         }
 
         if (!s_offline_mode && has_pending_packets &&
@@ -1082,112 +1242,207 @@ static void send_task(void *pvParameters)
 /* Application entry point */
 void app_main(void)
 {
+    bool diagnostic_mode = true;
+    s_diagnostic_mode = diagnostic_mode;
+
     esp_err_t early_web_monitor_err = web_monitor_manager_early_init();
     if (early_web_monitor_err != ESP_OK) {
         ESP_LOGW(TAG, "Early web monitor capture init failed: %s", esp_err_to_name(early_web_monitor_err));
     }
 
-    const i2c_manager_config_t i2c_config = {
-        .port = I2C_PORT_NUM,
-        .sda_io_num = I2C_SDA_GPIO,
-        .scl_io_num = I2C_SCL_GPIO,
-        .scl_speed_hz = I2C_FREQ_HZ,
-        .enable_internal_pullup = true,
-        .glitch_ignore_cnt = 7,
-    };
-    const espnow_manager_config_t espnow_config = {
-        .peer_mac = {0x24, 0x6f, 0x28, 0xb9, 0xb4, 0xb0},
-        .channel = ESPNOW_CHANNEL,
-        .encrypt = false,
-        .log_tag = TAG,
-    };
-
     ESP_ERROR_CHECK(led_manager_init(LED_GPIO, true));
-    esp_err_t battery_err = battery_probe_init(BATTERY_SENSE_GPIO);
-    if (battery_err != ESP_OK) {
-        ESP_LOGW(TAG, "Battery probe init failed on GPIO35: %s", esp_err_to_name(battery_err));
-    } else {
-        battery_probe_ready = true;
-        log_battery_probe();
-    }
-
-    esp_err_t dht_err = dht_manager_init(HUMITURE_GPIO, HUMITURE_TYPE);
-    if (dht_err != ESP_OK) {
-        log_sensor_error("DHT", dht_err);
-    } else {
-        dht_ready = true;
-    }
-
-    ESP_ERROR_CHECK(i2c_manager_init(&i2c_config, &i2c_bus));
-    i2c_manager_scan(i2c_bus, i2c_config.scl_speed_hz, TAG);
-    initialize_sensors();
-
-    esp_err_t ret = nvs_flash_init();
-    if (ret == ESP_ERR_NVS_NO_FREE_PAGES || ret == ESP_ERR_NVS_NEW_VERSION_FOUND)
-    {
-        ESP_ERROR_CHECK(nvs_flash_erase());
-        ret = nvs_flash_init();
-    }
-    ESP_ERROR_CHECK(ret);
-    ESP_ERROR_CHECK(init_persistent_queue());
-
-    ESP_ERROR_CHECK(espnow_manager_init(&espnow_config));
-    memcpy(base_station_mac, espnow_config.peer_mac, sizeof(base_station_mac));
-    ESP_ERROR_CHECK(espnow_manager_register_recv_cb(handle_base_station_message, NULL));
-
-    const web_monitor_manager_config_t web_monitor_config = {
-        .ap_ssid = WEB_MONITOR_AP_SSID,
-        .ap_password = WEB_MONITOR_AP_PASSWORD,
-        .channel = ESPNOW_CHANNEL,
-        .max_connections = 1,
-    };
-    esp_err_t web_monitor_err = web_monitor_manager_init(&web_monitor_config);
-    if (web_monitor_err != ESP_OK) {
-        ESP_LOGW(TAG, "Web monitor init failed: %s", esp_err_to_name(web_monitor_err));
-    }
-
-    uint8_t wifi_sta_mac[6] = {0};
-    ESP_ERROR_CHECK(esp_read_mac(wifi_sta_mac, ESP_MAC_WIFI_STA));
-    snprintf(node_id, sizeof(node_id), "%02X:%02X:%02X:%02X:%02X:%02X",
-             wifi_sta_mac[0], wifi_sta_mac[1], wifi_sta_mac[2],
-             wifi_sta_mac[3], wifi_sta_mac[4], wifi_sta_mac[5]);
-
-    /* Initialise MEMS microphone (I2S) */
-    const mic_manager_config_t mic_config = {
-        .bck_gpio    = MIC_I2S_BCK_GPIO,
-        .ws_gpio     = MIC_I2S_WS_GPIO,
-        .din_gpio    = MIC_I2S_DIN_GPIO,
-        .sample_rate = AUDIO_SAMPLE_RATE,
-    };
-    esp_err_t mic_err = mic_manager_init(&mic_config);
-    if (mic_err != ESP_OK) {
-        ESP_LOGE(TAG, "Microphone init failed: %s", esp_err_to_name(mic_err));
-    }
-
-    ESP_LOGI(TAG, "WS2812/status LED feature disabled in firmware");
+    ESP_ERROR_CHECK(led_manager_set(false));
 
     button_gpio_init();
-    s_offline_mode = nvs_load_offline_flag();
 
-    if (button_held_at_boot()) {
-        ESP_LOGI(TAG, "Boot button held — probing basestation for up to 10s");
-        bool reachable = probe_basestation_for(10000);
-        s_offline_mode = !reachable;
-        nvs_store_offline_flag(s_offline_mode);
-        ESP_LOGI(TAG, "Boot decision: %s",
-                 s_offline_mode ? "OFFLINE (no basestation ack)" : "ONLINE (basestation reachable)");
+    if (diagnostic_mode) {
+        const i2c_manager_config_t i2c_config = {
+            .port = I2C_PORT_NUM,
+            .sda_io_num = I2C_SDA_GPIO,
+            .scl_io_num = I2C_SCL_GPIO,
+            .scl_speed_hz = I2C_FREQ_HZ,
+            .enable_internal_pullup = true,
+            .glitch_ignore_cnt = 7,
+        };
+        const espnow_manager_config_t espnow_config = {
+            .peer_mac = {0xff, 0xff, 0xff, 0xff, 0xff, 0xff},
+            .channel = ESPNOW_CHANNEL,
+            .encrypt = false,
+            .log_tag = TAG,
+        };
+
+        esp_err_t battery_err = battery_probe_init(BATTERY_SENSE_GPIO);
+        if (battery_err != ESP_OK) {
+            ESP_LOGW(TAG, "Battery probe init failed on GPIO35: %s", esp_err_to_name(battery_err));
+        } else {
+            battery_probe_ready = true;
+        }
+
+        esp_err_t dht_err = dht_manager_init(HUMITURE_GPIO, HUMITURE_TYPE);
+        if (dht_err != ESP_OK) {
+            log_sensor_error("DHT", dht_err);
+        } else {
+            dht_ready = true;
+        }
+
+        esp_err_t ret = nvs_flash_init();
+        if (ret == ESP_ERR_NVS_NO_FREE_PAGES || ret == ESP_ERR_NVS_NEW_VERSION_FOUND)
+        {
+            ESP_ERROR_CHECK(nvs_flash_erase());
+            ret = nvs_flash_init();
+        }
+        ESP_ERROR_CHECK(ret);
+        ESP_ERROR_CHECK(init_persistent_queue());
+
+        ESP_ERROR_CHECK(i2c_manager_init(&i2c_config, &i2c_bus));
+        i2c_manager_scan(i2c_bus, i2c_config.scl_speed_hz, TAG);
+        initialize_sensors();
+
+        esp_err_t espnow_err = espnow_manager_init(&espnow_config);
+        if (espnow_err != ESP_OK) {
+            ESP_LOGE(TAG, "Diagnostic ESPNOW init failed: %s", esp_err_to_name(espnow_err));
+            s_offline_mode = true;
+        } else {
+            s_offline_mode = false;
+            memcpy(base_station_mac, espnow_config.peer_mac, sizeof(base_station_mac));
+            esp_err_t recv_cb_err = espnow_manager_register_recv_cb(handle_base_station_message, NULL);
+            if (recv_cb_err != ESP_OK) {
+                ESP_LOGW(TAG, "Diagnostic ESPNOW recv callback registration failed: %s",
+                         esp_err_to_name(recv_cb_err));
+            }
+        }
+
+        uint8_t wifi_sta_mac[6] = {0};
+        ESP_ERROR_CHECK(esp_read_mac(wifi_sta_mac, ESP_MAC_WIFI_STA));
+        snprintf(node_id, sizeof(node_id), "%02X:%02X:%02X:%02X:%02X:%02X",
+                 wifi_sta_mac[0], wifi_sta_mac[1], wifi_sta_mac[2],
+                 wifi_sta_mac[3], wifi_sta_mac[4], wifi_sta_mac[5]);
+
+        const mic_manager_config_t mic_config = {
+            .bck_gpio    = MIC_I2S_BCK_GPIO,
+            .ws_gpio     = MIC_I2S_WS_GPIO,
+            .din_gpio    = MIC_I2S_DIN_GPIO,
+            .sample_rate = AUDIO_SAMPLE_RATE,
+        };
+        esp_err_t mic_err = mic_manager_init(&mic_config);
+        if (mic_err != ESP_OK) {
+            ESP_LOGE(TAG, "Diagnostic microphone init failed: %s", esp_err_to_name(mic_err));
+        }
+
+        const web_monitor_manager_config_t web_monitor_config = {
+            .ap_ssid = WEB_MONITOR_AP_SSID,
+            .ap_password = WEB_MONITOR_AP_PASSWORD,
+            .channel = ESPNOW_CHANNEL,
+            .max_connections = 1,
+        };
+        esp_err_t web_monitor_err = web_monitor_manager_init(&web_monitor_config);
+        if (web_monitor_err != ESP_OK) {
+            ESP_LOGW(TAG, "Web monitor init failed: %s", esp_err_to_name(web_monitor_err));
+        }
+
+        ESP_LOGI(TAG, "Diagnostic mode: button + LED + full audio path + rewritten sensor send path");
+        xTaskCreate(send_task, "send_task", 4096, NULL, 4, NULL);
     } else {
-        ESP_LOGI(TAG, "Boot decision (button not held): %s",
-                 s_offline_mode ? "OFFLINE (resumed)" : "ONLINE");
+        const web_monitor_manager_config_t web_monitor_config = {
+            .ap_ssid = WEB_MONITOR_AP_SSID,
+            .ap_password = WEB_MONITOR_AP_PASSWORD,
+            .channel = ESPNOW_CHANNEL,
+            .max_connections = 1,
+        };
+        esp_err_t web_monitor_err = web_monitor_manager_init(&web_monitor_config);
+        if (web_monitor_err != ESP_OK) {
+            ESP_LOGW(TAG, "Web monitor init failed: %s", esp_err_to_name(web_monitor_err));
+        }
+
+        const i2c_manager_config_t i2c_config = {
+            .port = I2C_PORT_NUM,
+            .sda_io_num = I2C_SDA_GPIO,
+            .scl_io_num = I2C_SCL_GPIO,
+            .scl_speed_hz = I2C_FREQ_HZ,
+            .enable_internal_pullup = true,
+            .glitch_ignore_cnt = 7,
+        };
+        const espnow_manager_config_t espnow_config = {
+            .peer_mac = {0xff, 0xff, 0xff, 0xff, 0xff, 0xff},
+            .channel = ESPNOW_CHANNEL,
+            .encrypt = false,
+            .log_tag = TAG,
+        };
+
+        esp_err_t battery_err = battery_probe_init(BATTERY_SENSE_GPIO);
+        if (battery_err != ESP_OK) {
+            ESP_LOGW(TAG, "Battery probe init failed on GPIO35: %s", esp_err_to_name(battery_err));
+        } else {
+            battery_probe_ready = true;
+            log_battery_probe();
+        }
+
+        esp_err_t dht_err = dht_manager_init(HUMITURE_GPIO, HUMITURE_TYPE);
+        if (dht_err != ESP_OK) {
+            log_sensor_error("DHT", dht_err);
+        } else {
+            dht_ready = true;
+        }
+
+        ESP_ERROR_CHECK(i2c_manager_init(&i2c_config, &i2c_bus));
+        i2c_manager_scan(i2c_bus, i2c_config.scl_speed_hz, TAG);
+        initialize_sensors();
+
+        esp_err_t ret = nvs_flash_init();
+        if (ret == ESP_ERR_NVS_NO_FREE_PAGES || ret == ESP_ERR_NVS_NEW_VERSION_FOUND)
+        {
+            ESP_ERROR_CHECK(nvs_flash_erase());
+            ret = nvs_flash_init();
+        }
+        ESP_ERROR_CHECK(ret);
+        ESP_ERROR_CHECK(init_persistent_queue());
+
+        ESP_ERROR_CHECK(espnow_manager_init(&espnow_config));
+        memcpy(base_station_mac, espnow_config.peer_mac, sizeof(base_station_mac));
+        ESP_ERROR_CHECK(espnow_manager_register_recv_cb(handle_base_station_message, NULL));
+
+        uint8_t wifi_sta_mac[6] = {0};
+        ESP_ERROR_CHECK(esp_read_mac(wifi_sta_mac, ESP_MAC_WIFI_STA));
+        snprintf(node_id, sizeof(node_id), "%02X:%02X:%02X:%02X:%02X:%02X",
+                 wifi_sta_mac[0], wifi_sta_mac[1], wifi_sta_mac[2],
+                 wifi_sta_mac[3], wifi_sta_mac[4], wifi_sta_mac[5]);
+
+        const mic_manager_config_t mic_config = {
+            .bck_gpio    = MIC_I2S_BCK_GPIO,
+            .ws_gpio     = MIC_I2S_WS_GPIO,
+            .din_gpio    = MIC_I2S_DIN_GPIO,
+            .sample_rate = AUDIO_SAMPLE_RATE,
+        };
+        esp_err_t mic_err = mic_manager_init(&mic_config);
+        if (mic_err != ESP_OK) {
+            ESP_LOGE(TAG, "Microphone init failed: %s", esp_err_to_name(mic_err));
+        }
+
+        ESP_LOGI(TAG, "WS2812/status LED feature disabled in firmware");
+
+        s_offline_mode = nvs_load_offline_flag();
+
+        if (button_held_at_boot()) {
+            ESP_LOGI(TAG, "Boot button held — probing basestation for up to 10s");
+            bool reachable = probe_basestation_for(10000);
+            s_offline_mode = !reachable;
+            nvs_store_offline_flag(s_offline_mode);
+            ESP_LOGI(TAG, "Boot decision: %s",
+                     s_offline_mode ? "OFFLINE (no basestation ack)" : "ONLINE (basestation reachable)");
+        } else {
+            ESP_LOGI(TAG, "Boot decision (button not held): %s",
+                     s_offline_mode ? "OFFLINE (resumed)" : "ONLINE");
+        }
+
+        ESP_LOGI(TAG, "Queued at startup: %u audio chunk(s), %u sensor payload(s)",
+                 (unsigned)count_queued_packets(QUEUE_KIND_AUDIO),
+                 (unsigned)count_queued_packets(QUEUE_KIND_SENSOR));
+
+        xTaskCreate(send_task, "send_task", 4096, NULL, 4, NULL);
     }
 
-    ESP_LOGI(TAG, "Queued at startup: %u audio chunk(s), %u sensor payload(s)",
-             (unsigned)count_queued_packets(QUEUE_KIND_AUDIO),
-             (unsigned)count_queued_packets(QUEUE_KIND_SENSOR));
-
-    xTaskCreate(send_task, "send_task", 4096, NULL, 4, NULL);
     xTaskCreate(button_task, "button_task", 8192, NULL, 5, NULL);
 
-    ESP_LOGI(TAG, "Transmitter ready");
+    ESP_LOGI(TAG, "Diagnostic firmware ready");
     web_monitor_manager_finalize_startup_history();
 }

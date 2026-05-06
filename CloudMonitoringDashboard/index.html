@@ -1,5 +1,6 @@
 <!DOCTYPE html>
 <html lang="en">
+
 <head>
     <meta charset="UTF-8" />
     <meta name="viewport" content="width=device-width, initial-scale=1.0" />
@@ -10,64 +11,320 @@
     <script src="https://cdn.jsdelivr.net/npm/chart.js"></script>
 
     <style>
-        * { box-sizing: border-box; }
-        html, body { margin: 0; padding: 0; min-height: 100%; font-family: 'Segoe UI', Tahoma, Geneva, Verdana, sans-serif; background: #eef2f7; }
-        body { color: #1f2937; }
-        .dashboard { max-width: 1280px; margin: 0 auto; padding: 24px; }
+        * {
+            box-sizing: border-box;
+        }
 
-        .top-bar { display: flex; flex-wrap: wrap; justify-content: space-between; gap: 16px; margin-bottom: 18px; }
-        .title-block { max-width: 720px; }
-        .title-block h1 { font-size: 34px; margin-bottom: 8px; letter-spacing: -0.03em; }
-        .title-block p { color: #4b5563; font-size: 14px; line-height: 1.7; }
-        .status-chip { display: inline-flex; align-items: center; gap: 10px; padding: 10px 14px; background: #f8fafc; border-radius: 999px; border: 1px solid #d1d5db; color: #111827; font-weight: 600; }
-        .status-dot { width: 10px; height: 10px; border-radius: 999px; background: #34d399; }
-        .status-dot.offline { background: #f87171; }
+        html,
+        body {
+            margin: 0;
+            padding: 0;
+            min-height: 100%;
+            font-family: 'Segoe UI', Tahoma, Geneva, Verdana, sans-serif;
+            background: #eef2f7;
+        }
 
-        .alert-banner { border-radius: 16px; padding: 16px 20px; display: flex; align-items: center; gap: 12px; margin-bottom: 20px; border: 1px solid transparent; }
-        .alert-banner.normal { background: #eff6ff; color: #1d4ed8; border-color: #bfdbfe; }
-        .alert-banner.warning { background: #fffbeb; color: #92400e; border-color: #fde68a; }
-        .alert-banner.danger { background: #fef2f2; color: #b91c1c; border-color: #fecaca; }
+        body {
+            color: #1f2937;
+        }
 
-        .summary-grid { display: grid; grid-template-columns: repeat(3, minmax(0, 1fr)); grid-auto-rows: 240px; gap: 18px; margin-bottom: 20px; }
-        .card { background: #ffffff; border-radius: 20px; padding: 22px; border: 1px solid rgba(148, 163, 184, 0.18); box-shadow: 0 14px 36px rgba(15, 23, 42, 0.06); min-height: 240px; max-height: 240px; display: flex; flex-direction: column; overflow: hidden; }
-        .card h2 { margin: 0 0 10px; font-size: 12px; color: #64748b; text-transform: uppercase; letter-spacing: 0.12em; }
-        .card .value { font-size: 38px; font-weight: 700; color: #0f172a; line-height: 1; }
-        .card .subtitle { margin-top: 10px; color: #64748b; font-size: 13px; }
-        .mini-chart { width: 100%; height: 88px !important; max-height: 88px; margin-top: auto; flex-shrink: 0; display: block; }
-        .card canvas { width: 100% !important; display: block; }
+        .dashboard {
+            max-width: 1280px;
+            margin: 0 auto;
+            padding: 24px;
+        }
 
-        .main-grid { display: grid; grid-template-columns: 1.55fr 1fr; gap: 18px; margin-bottom: 0; }
-        .section { background: #ffffff; border-radius: 20px; padding: 22px; border: 1px solid rgba(148, 163, 184, 0.18); box-shadow: 0 14px 36px rgba(15, 23, 42, 0.06); }
-        .section { display: flex; flex-direction: column; }
-        .section h2 { margin-top: 0; margin-bottom: 6px; font-size: 16px; color: #0f172a; }
-        .section p { margin-top: 0; margin-bottom: 12px; color: #64748b; font-size: 12px; line-height: 1.5; }
+        .top-bar {
+            display: flex;
+            flex-wrap: wrap;
+            justify-content: space-between;
+            gap: 16px;
+            margin-bottom: 18px;
+        }
 
-        .status-list, .log-list { display: grid; gap: 14px; }
-        .status-card, .log-card { background: #f8fafc; border-radius: 16px; padding: 16px 18px; border: 1px solid rgba(148, 163, 184, 0.18); }
-        .status-card strong, .log-card strong { display: block; margin-bottom: 6px; font-size: 14px; color: #111827; }
-        .status-card small, .log-card small { color: #64748b; font-size: 12px; }
-        .status-pill { display: inline-flex; padding: 6px 12px; border-radius: 999px; font-size: 11px; font-weight: 700; letter-spacing: 0.08em; text-transform: uppercase; }
-        .pill-online { background: #dcfce7; color: #166534; }
-        .pill-warning { background: #ffedd5; color: #9a3412; }
-        .pill-danger { background: #fee2e2; color: #991b1b; }
+        .title-block {
+            max-width: 720px;
+        }
 
-        .scroll-panel { height: 280px; overflow-y: auto; overflow-x: hidden; padding-right: 6px; flex-grow: 1; }
-        .scroll-panel::-webkit-scrollbar { width: 7px; }
-        .scroll-panel::-webkit-scrollbar-track { background: transparent; }
-        .scroll-panel::-webkit-scrollbar-thumb { background: rgba(100, 116, 139, 0.4); border-radius: 999px; }
-        .scroll-panel::-webkit-scrollbar-thumb:hover { background: rgba(100, 116, 139, 0.6); }
+        .title-block h1 {
+            font-size: 34px;
+            margin-bottom: 8px;
+            letter-spacing: -0.03em;
+        }
 
-        .empty-state { text-align: center; padding: 20px 0; color: #94a3b8; font-size: 13px; }
+        .title-block p {
+            color: #4b5563;
+            font-size: 14px;
+            line-height: 1.7;
+        }
 
-        @media (max-width: 980px) { .summary-grid, .main-grid { grid-template-columns: 1fr; } }
+        .status-chip {
+            display: inline-flex;
+            align-items: center;
+            gap: 10px;
+            padding: 10px 14px;
+            background: #f8fafc;
+            border-radius: 999px;
+            border: 1px solid #d1d5db;
+            color: #111827;
+            font-weight: 600;
+        }
+
+        .status-dot {
+            width: 10px;
+            height: 10px;
+            border-radius: 999px;
+            background: #34d399;
+        }
+
+        .status-dot.offline {
+            background: #f87171;
+        }
+
+        .alert-banner {
+            border-radius: 16px;
+            padding: 16px 20px;
+            display: flex;
+            align-items: center;
+            gap: 12px;
+            margin-bottom: 20px;
+            border: 1px solid transparent;
+        }
+
+        .alert-banner.normal {
+            background: #eff6ff;
+            color: #1d4ed8;
+            border-color: #bfdbfe;
+        }
+
+        .alert-banner.warning {
+            background: #fffbeb;
+            color: #92400e;
+            border-color: #fde68a;
+        }
+
+        .alert-banner.danger {
+            background: #fef2f2;
+            color: #b91c1c;
+            border-color: #fecaca;
+        }
+
+        .log-card.warning-warning {
+            border-left: 3px solid #f59e0b;
+        }
+
+        .log-card.warning-danger {
+            border-left: 3px solid #dc2626;
+        }
+
+        .log-card.warning-error {
+            border-left: 3px solid #6b7280;
+        }
+
+        .log-card audio {
+            width: 100%;
+            margin-top: 8px;
+        }
+
+        .log-card .reasoning {
+            display: block;
+            margin-top: 4px;
+            font-style: italic;
+        }
+
+        .summary-grid {
+            display: grid;
+            grid-template-columns: repeat(3, minmax(0, 1fr));
+            grid-auto-rows: 240px;
+            gap: 18px;
+            margin-bottom: 20px;
+        }
+
+        .card {
+            background: #ffffff;
+            border-radius: 20px;
+            padding: 22px;
+            border: 1px solid rgba(148, 163, 184, 0.18);
+            box-shadow: 0 14px 36px rgba(15, 23, 42, 0.06);
+            min-height: 240px;
+            max-height: 240px;
+            display: flex;
+            flex-direction: column;
+            overflow: hidden;
+        }
+
+        .card h2 {
+            margin: 0 0 10px;
+            font-size: 12px;
+            color: #64748b;
+            text-transform: uppercase;
+            letter-spacing: 0.12em;
+        }
+
+        .card .value {
+            font-size: 38px;
+            font-weight: 700;
+            color: #0f172a;
+            line-height: 1;
+        }
+
+        .card .subtitle {
+            margin-top: 10px;
+            color: #64748b;
+            font-size: 13px;
+        }
+
+        .mini-chart {
+            width: 100%;
+            height: 88px !important;
+            max-height: 88px;
+            margin-top: auto;
+            flex-shrink: 0;
+            display: block;
+        }
+
+        .card canvas {
+            width: 100% !important;
+            display: block;
+        }
+
+        .main-grid {
+            display: grid;
+            grid-template-columns: 1.55fr 1fr;
+            gap: 18px;
+            margin-bottom: 0;
+        }
+
+        .section {
+            background: #ffffff;
+            border-radius: 20px;
+            padding: 22px;
+            border: 1px solid rgba(148, 163, 184, 0.18);
+            box-shadow: 0 14px 36px rgba(15, 23, 42, 0.06);
+        }
+
+        .section {
+            display: flex;
+            flex-direction: column;
+        }
+
+        .section h2 {
+            margin-top: 0;
+            margin-bottom: 6px;
+            font-size: 16px;
+            color: #0f172a;
+        }
+
+        .section p {
+            margin-top: 0;
+            margin-bottom: 12px;
+            color: #64748b;
+            font-size: 12px;
+            line-height: 1.5;
+        }
+
+        .status-list,
+        .log-list {
+            display: grid;
+            gap: 14px;
+        }
+
+        .status-card,
+        .log-card {
+            background: #f8fafc;
+            border-radius: 16px;
+            padding: 16px 18px;
+            border: 1px solid rgba(148, 163, 184, 0.18);
+        }
+
+        .status-card strong,
+        .log-card strong {
+            display: block;
+            margin-bottom: 6px;
+            font-size: 14px;
+            color: #111827;
+        }
+
+        .status-card small,
+        .log-card small {
+            color: #64748b;
+            font-size: 12px;
+        }
+
+        .status-pill {
+            display: inline-flex;
+            padding: 6px 12px;
+            border-radius: 999px;
+            font-size: 11px;
+            font-weight: 700;
+            letter-spacing: 0.08em;
+            text-transform: uppercase;
+        }
+
+        .pill-online {
+            background: #dcfce7;
+            color: #166534;
+        }
+
+        .pill-warning {
+            background: #ffedd5;
+            color: #9a3412;
+        }
+
+        .pill-danger {
+            background: #fee2e2;
+            color: #991b1b;
+        }
+
+        .scroll-panel {
+            height: 280px;
+            overflow-y: auto;
+            overflow-x: hidden;
+            padding-right: 6px;
+            flex-grow: 1;
+        }
+
+        .scroll-panel::-webkit-scrollbar {
+            width: 7px;
+        }
+
+        .scroll-panel::-webkit-scrollbar-track {
+            background: transparent;
+        }
+
+        .scroll-panel::-webkit-scrollbar-thumb {
+            background: rgba(100, 116, 139, 0.4);
+            border-radius: 999px;
+        }
+
+        .scroll-panel::-webkit-scrollbar-thumb:hover {
+            background: rgba(100, 116, 139, 0.6);
+        }
+
+        .empty-state {
+            text-align: center;
+            padding: 20px 0;
+            color: #94a3b8;
+            font-size: 13px;
+        }
+
+        @media (max-width: 980px) {
+
+            .summary-grid,
+            .main-grid {
+                grid-template-columns: 1fr;
+            }
+        }
     </style>
 </head>
+
 <body>
     <div class="dashboard">
         <div class="top-bar">
             <div class="title-block">
                 <h1>IoT Mine Safety Monitoring</h1>
-                <p>Realtime sensor view for temperature, humidity, pressure, node status, and audio/transcription alerts.</p>
+                <p>Realtime sensor view for temperature, humidity, pressure, node status, and audio/transcription
+                    alerts.</p>
             </div>
             <div class="status-chip" id="connectionChip">
                 <span id="connectionDot" class="status-dot"></span>
@@ -137,12 +394,13 @@
 
     <script>
         const firebaseConfig = {
-            apiKey: "AIzaSyAcZmW8CGW3eM4qQs2LR6ru5VDE1693oig",
-            authDomain: "iot-mine-safety.firebaseapp.com",
-            projectId: "iot-mine-safety",
-            storageBucket: "iot-mine-safety.firebasestorage.app",
-            messagingSenderId: "335965054917",
-            appId: "1:335965054917:web:19b4fb2d7c2d9dc9ba4dac"
+            apiKey: "AIzaSyBNEGGCWhFO4rD4TMQ1-TFz24BEdwjF8M4",
+            authDomain: "advanced-iot-mine-safety.firebaseapp.com",
+            projectId: "advanced-iot-mine-safety",
+            storageBucket: "advanced-iot-mine-safety.firebasestorage.app",
+            messagingSenderId: "1022724784807",
+            appId: "1:1022724784807:web:7941e097634c51569dd182",
+            measurementId: "G-H5X9X5SE0G"
         };
 
         firebase.initializeApp(firebaseConfig);
@@ -152,6 +410,37 @@
         function formatTime(timestamp) {
             if (!timestamp || !timestamp.toDate) return 'N/A';
             return timestamp.toDate().toLocaleTimeString([], { hour: '2-digit', minute: '2-digit', second: '2-digit' });
+        }
+
+        function formatWarningTime(w) {
+            if (w.received_at?.toDate) {
+                return w.received_at.toDate().toLocaleTimeString([], { hour: '2-digit', minute: '2-digit', second: '2-digit' });
+            }
+            if (typeof w.timestamp === 'string') {
+                const d = new Date(w.timestamp);
+                if (!isNaN(d.getTime())) {
+                    return d.toLocaleTimeString([], { hour: '2-digit', minute: '2-digit', second: '2-digit' });
+                }
+            }
+            return 'N/A';
+        }
+
+        function byReceivedAtDesc(a, b) {
+            const aTime = a.data().received_at?.toDate?.()?.getTime?.() || 0;
+            const bTime = b.data().received_at?.toDate?.()?.getTime?.() || 0;
+            return bTime - aTime;
+        }
+
+        function pillFor(level) {
+            if (level === 'warning') return 'pill-warning';
+            if (level === 'danger' || level === 'error') return 'pill-danger';
+            return 'pill-online';
+        }
+
+        function escapeHtml(text) {
+            const div = document.createElement('div');
+            div.textContent = text == null ? '' : String(text);
+            return div.innerHTML;
         }
 
         function initMiniCharts() {
@@ -300,47 +589,67 @@
             });
         }
 
-        function updateTranscriptionLog(rows) {
+        function updateTranscriptionLog(warningDocs) {
             const section = document.getElementById('transcriptionLog');
-            const hits = rows.filter(doc => doc.data().transcription || doc.data().speech_text);
-            if (!hits.length) {
+            if (!warningDocs.length) {
                 section.innerHTML = '<div class="empty-state">No transcription or audio alerts found.</div>';
                 return;
             }
             section.innerHTML = '';
-            hits.slice(0, 12).forEach(doc => {
-                const payload = doc.data();
-                const text = payload.transcription || payload.speech_text || 'No text available';
+            warningDocs.slice(0, 12).forEach(doc => {
+                const w = doc.data();
+                const level = w.classification?.warning_level || 'safe';
+                const reasoning = w.classification?.reasoning || '';
+                const transcript = w.transcript || '(no transcript)';
+                const audioUrl = w.audio_download_url;
+                const nodeId = w.node_id || w.mac_address || 'Unknown';
                 const card = document.createElement('div');
-                card.className = 'log-card';
+                card.className = `log-card warning-${level}`;
+                const audioHtml = audioUrl
+                    ? `<audio controls preload="none" src="${encodeURI(audioUrl)}"></audio>`
+                    : '';
                 card.innerHTML = `
-                    <strong>${payload.node_id || 'Unknown'}</strong>
-                    <span>${text}</span>
-                    <small>${formatTime(payload.received_at)}</small>
+                    <strong>${escapeHtml(nodeId)} <span class="status-pill ${pillFor(level)}">${escapeHtml(level)}</span></strong>
+                    <span>"${escapeHtml(transcript)}"</span>
+                    ${reasoning ? `<small class="reasoning">${escapeHtml(reasoning)}</small>` : ''}
+                    ${audioHtml}
+                    <small>${formatWarningTime(w)}</small>
                 `;
                 section.appendChild(card);
             });
         }
 
-        function computeAlertRows(rows) {
+        function computeAlertRows(sensorRows, warningDocs = []) {
             const alerts = [];
-            rows.forEach(doc => {
+            sensorRows.forEach(doc => {
                 const payload = doc.data();
                 const temp = payload.environment?.temperature;
                 if (typeof temp === 'number') {
                     if (temp > 80) {
-                        alerts.push({ level: 'danger', message: `${payload.node_id || 'Unknown'} audio/warning: temperature above 80°C` });
+                        alerts.push({ level: 'danger', message: `${payload.node_id || 'Unknown'} temperature above 80°C` });
                     } else if (temp > 35) {
                         alerts.push({ level: 'warning', message: `${payload.node_id || 'Unknown'} temperature high: ${temp.toFixed(1)}°C` });
                     }
                 }
             });
+            warningDocs.slice(0, 5).forEach(doc => {
+                const w = doc.data();
+                const lvl = w.classification?.warning_level;
+                if (lvl === 'danger' || lvl === 'warning') {
+                    const node = w.node_id || w.mac_address || 'Node';
+                    const snippet = (w.transcript || '').slice(0, 80);
+                    alerts.push({
+                        level: lvl,
+                        message: `${node} audio alert: "${snippet}"`
+                    });
+                }
+            });
             return alerts;
         }
 
-        function renderAlertBanner(rows) {
+        function renderAlertBanner(sensorRows, warningDocs) {
             const banner = document.getElementById('alertBanner');
-            const alerts = computeAlertRows(rows);
+            const alerts = computeAlertRows(sensorRows, warningDocs);
             if (!alerts.length) {
                 banner.className = 'alert-banner normal';
                 banner.textContent = 'No active alerts. System normal.';
@@ -351,30 +660,36 @@
             banner.textContent = highest.message;
         }
 
+        let latestSensorRows = [];
+        let latestWarnings = [];
+
         function loadData() {
-            const query = db.collection('iot-data').limit(100);
-            query.onSnapshot(snapshot => {
+            db.collection('iot-data').orderBy('received_at', 'desc').limit(100).onSnapshot(snapshot => {
                 updateConnection(true);
-                const rows = [];
-                snapshot.forEach(doc => rows.push(doc));
-                // Sort by received_at descending, treating missing timestamps as old
-                rows.sort((a, b) => {
-                    const aTime = a.data().received_at?.toDate?.()?.getTime?.() || 0;
-                    const bTime = b.data().received_at?.toDate?.()?.getTime?.() || 0;
-                    return bTime - aTime;
-                });
-                updateMiniStats(rows);
-                updateEnvironmentStatus(rows);
-                updateDeviceStatus(rows);
-                updateHealthLog(rows);
-                updateTranscriptionLog(rows);
-                renderAlertBanner(rows);
+                latestSensorRows = [];
+                snapshot.forEach(doc => latestSensorRows.push(doc));
+                latestSensorRows.sort(byReceivedAtDesc);
+                updateMiniStats(latestSensorRows);
+                updateEnvironmentStatus(latestSensorRows);
+                updateDeviceStatus(latestSensorRows);
+                updateHealthLog(latestSensorRows);
+                renderAlertBanner(latestSensorRows, latestWarnings);
             }, error => {
-                console.error('Firestore error', error);
+                console.error('Firestore iot-data error', error);
                 updateConnection(false);
                 document.getElementById('environmentStatus').innerHTML = '<div class="empty-state">Unable to load environment data.</div>';
                 document.getElementById('deviceStatus').innerHTML = '<div class="empty-state">Unable to load device status.</div>';
                 document.getElementById('healthLog').innerHTML = '<div class="empty-state">Unable to load health log.</div>';
+            });
+
+            db.collection('warnings').orderBy('received_at', 'desc').limit(50).onSnapshot(snapshot => {
+                latestWarnings = [];
+                snapshot.forEach(doc => latestWarnings.push(doc));
+                latestWarnings.sort(byReceivedAtDesc);
+                updateTranscriptionLog(latestWarnings);
+                renderAlertBanner(latestSensorRows, latestWarnings);
+            }, error => {
+                console.error('Firestore warnings error', error);
                 document.getElementById('transcriptionLog').innerHTML = '<div class="empty-state">Unable to load transcription log.</div>';
             });
         }

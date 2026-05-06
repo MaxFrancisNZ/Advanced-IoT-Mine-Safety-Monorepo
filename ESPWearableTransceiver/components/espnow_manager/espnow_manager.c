@@ -19,18 +19,43 @@ static void *s_recv_cb_context = NULL;
 
 static void wifi_init_sta(uint8_t channel)
 {
-    ESP_ERROR_CHECK(esp_netif_init());
-    ESP_ERROR_CHECK(esp_event_loop_create_default());
+    esp_err_t err = esp_netif_init();
+    if (err != ESP_OK && err != ESP_ERR_INVALID_STATE) {
+        ESP_ERROR_CHECK(err);
+    }
+
+    err = esp_event_loop_create_default();
+    if (err != ESP_OK && err != ESP_ERR_INVALID_STATE) {
+        ESP_ERROR_CHECK(err);
+    }
+
     esp_netif_create_default_wifi_sta();
 
     wifi_init_config_t cfg = WIFI_INIT_CONFIG_DEFAULT();
-    ESP_ERROR_CHECK(esp_wifi_init(&cfg));
+    err = esp_wifi_init(&cfg);
+    if (err != ESP_OK && err != ESP_ERR_INVALID_STATE) {
+        ESP_ERROR_CHECK(err);
+    }
 
-    ESP_ERROR_CHECK(esp_wifi_set_mode(WIFI_MODE_STA));
-    ESP_ERROR_CHECK(esp_wifi_start());
+    wifi_mode_t mode = WIFI_MODE_NULL;
+    err = esp_wifi_get_mode(&mode);
+    if (err != ESP_OK) {
+        ESP_ERROR_CHECK(err);
+    }
+
+    if (mode == WIFI_MODE_NULL) {
+        ESP_ERROR_CHECK(esp_wifi_set_mode(WIFI_MODE_STA));
+    } else if (mode == WIFI_MODE_AP) {
+        ESP_ERROR_CHECK(esp_wifi_set_mode(WIFI_MODE_APSTA));
+    }
+
+    err = esp_wifi_start();
+    if (err != ESP_OK && err != ESP_ERR_INVALID_STATE) {
+        ESP_ERROR_CHECK(err);
+    }
     ESP_ERROR_CHECK(esp_wifi_set_channel(channel, WIFI_SECOND_CHAN_NONE));
 
-    ESP_LOGI(TAG, "Wi-Fi STA started on channel %u", channel);
+    ESP_LOGI(TAG, "Wi-Fi ready for ESPNOW on channel %u (mode=%d)", channel, mode);
 }
 
 static void espnow_send_cb(const esp_now_send_info_t *tx_info, esp_now_send_status_t status)
