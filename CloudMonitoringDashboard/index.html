@@ -394,6 +394,34 @@
             font-size: 13px;
         }
 
+        .timeline-section {
+            margin-bottom: 18px;
+        }
+
+        .event-timeline-canvas {
+            width: 100%;
+            height: 200px;
+            display: block;
+        }
+
+        .timeline-legend {
+            display: flex;
+            flex-wrap: wrap;
+            gap: 12px;
+            margin-top: 8px;
+            font-size: 11px;
+            color: #64748b;
+        }
+
+        .timeline-legend-dot {
+            display: inline-block;
+            width: 8px;
+            height: 8px;
+            border-radius: 999px;
+            margin-right: 4px;
+            vertical-align: middle;
+        }
+
         .node-mac {
             font-size: 11px;
             color: #64748b;
@@ -423,6 +451,87 @@
 
         .calibrate-btn:hover {
             background: #f1f5f9;
+        }
+
+        .battery-row {
+            display: flex;
+            align-items: center;
+            gap: 10px;
+            margin-top: 8px;
+            color: #334155;
+            font-size: 12px;
+        }
+
+        .battery-shell {
+            position: relative;
+            width: 34px;
+            height: 16px;
+            border: 1.5px solid #94a3b8;
+            border-radius: 4px;
+            background: #e2e8f0;
+            overflow: hidden;
+            flex-shrink: 0;
+        }
+
+        .battery-shell::after {
+            content: "";
+            position: absolute;
+            right: -4px;
+            top: 4px;
+            width: 3px;
+            height: 6px;
+            border-radius: 0 2px 2px 0;
+            background: #94a3b8;
+        }
+
+        .battery-fill {
+            height: 100%;
+            border-radius: 2px;
+            background: #22c55e;
+        }
+
+        .battery-fill.warning {
+            background: #f59e0b;
+        }
+
+        .battery-fill.danger {
+            background: #ef4444;
+        }
+
+        .battery-text {
+            color: #475569;
+            white-space: nowrap;
+        }
+
+        .orientation-visual {
+            display: flex;
+            align-items: center;
+            gap: 12px;
+            margin-top: 8px;
+        }
+
+        .orientation-figure {
+            width: 72px;
+            height: 72px;
+            flex-shrink: 0;
+        }
+
+        .orientation-meta {
+            display: flex;
+            flex-direction: column;
+            gap: 2px;
+            min-width: 0;
+        }
+
+        .orientation-angle {
+            font-size: 12px;
+            font-weight: 700;
+            color: #0f172a;
+        }
+
+        .orientation-caption {
+            font-size: 11px;
+            color: #64748b;
         }
 
         .modal-overlay {
@@ -569,6 +678,20 @@
                 <div class="value" id="elevStat">-- m</div>
                 <div class="subtitle" id="elevSubtitle">Ref: 1013.25 hPa (default)</div>
                 <canvas id="elevMiniChart" class="mini-chart"></canvas>
+            </div>
+        </div>
+
+        <div class="section timeline-section">
+            <h2>Event Timeline</h2>
+            <p>Online/offline transitions, audio alerts, and fall events for the selected device.</p>
+            <canvas id="eventTimeline" class="event-timeline-canvas"></canvas>
+            <div class="timeline-legend">
+                <span><span class="timeline-legend-dot" style="background:#16a34a;"></span>Online</span>
+                <span><span class="timeline-legend-dot" style="background:#6b7280;"></span>Offline</span>
+                <span><span class="timeline-legend-dot" style="background:#dc2626;"></span>Fall / Audio danger</span>
+                <span><span class="timeline-legend-dot" style="background:#f59e0b;"></span>Fall cleared / Audio warning</span>
+                <span><span class="timeline-legend-dot" style="background:#3b82f6;"></span>Audio safe</span>
+                <span><span class="timeline-legend-dot" style="background:#9ca3af;"></span>Audio cleared</span>
             </div>
         </div>
 
@@ -720,6 +843,8 @@
         }
 
         const DEFAULT_SEA_LEVEL_HPA = 1013.25;
+        const BATTERY_EMPTY_V = 3.0;
+        const BATTERY_FULL_V = 4.2;
         let weatherReference = null;
 
         function referencePressureHpa() {
@@ -738,6 +863,265 @@
             if (typeof env.elevation === 'number') return env.elevation;
             if (typeof env.barometric_pressure === 'number') return pressureToElevation(env.barometric_pressure);
             return null;
+        }
+
+        function batteryVoltage(payload) {
+            const env = payload?.environment || {};
+            const candidates = [
+                payload?.battery_voltage,
+                payload?.battery_volts,
+                payload?.battery_v,
+                payload?.voltage,
+                payload?.vbat,
+                payload?.vbatt,
+                env?.battery_voltage,
+                env?.battery_volts,
+                env?.battery_v,
+                env?.voltage,
+                env?.vbat,
+                env?.vbatt
+            ];
+            for (const value of candidates) {
+                if (typeof value === 'number' && isFinite(value)) return value;
+            }
+            return null;
+        }
+
+        function batteryPercentFromVoltage(voltage) {
+            if (typeof voltage !== 'number' || !isFinite(voltage)) return null;
+            const raw = ((voltage - BATTERY_EMPTY_V) / (BATTERY_FULL_V - BATTERY_EMPTY_V)) * 100;
+            return Math.max(0, Math.min(100, Math.round(raw)));
+        }
+
+        function batterySeverity(percent) {
+            if (typeof percent !== 'number') return 'unknown';
+            if (percent <= 15) return 'danger';
+            if (percent <= 35) return 'warning';
+            return 'normal';
+        }
+
+        function batteryIndicatorHtml(payload) {
+            const voltage = batteryVoltage(payload);
+            const percent = batteryPercentFromVoltage(voltage);
+            if (percent == null) {
+                return '<div class="battery-row"><span class="battery-text">Battery: unavailable</span></div>';
+            }
+            const severity = batterySeverity(percent);
+            const fillClass = severity === 'danger' ? 'danger' : severity === 'warning' ? 'warning' : '';
+            const voltageLabel = `${voltage.toFixed(2)}V`;
+            return `
+                <div class="battery-row">
+                    <div class="battery-shell" aria-hidden="true">
+                        <div class="battery-fill ${fillClass}" style="width:${percent}%;"></div>
+                    </div>
+                    <span class="battery-text">Battery: ${percent}% (${voltageLabel})</span>
+                </div>
+            `;
+        }
+
+        function orientationIndicatorHtml(tiltDeg) {
+            if (typeof tiltDeg !== 'number' || !isFinite(tiltDeg)) return '';
+            const clampedTilt = Math.max(0, Math.min(180, tiltDeg));
+            const state = clampedTilt >= 150 ? 'Inverted' : clampedTilt >= HORIZONTAL_TILT_DEG ? 'Horizontal risk' : 'Upright';
+            const color = clampedTilt >= HORIZONTAL_TILT_DEG ? '#dc2626' : clampedTilt >= 30 ? '#f59e0b' : '#16a34a';
+            const figureRotation = clampedTilt;
+            return `
+                <div class="orientation-visual">
+                    <svg class="orientation-figure" viewBox="0 0 72 72" aria-hidden="true">
+                        <rect x="0" y="0" width="72" height="72" rx="12" fill="#ffffff"/>
+                        <line x1="36" y1="10" x2="36" y2="58" stroke="#cbd5e1" stroke-width="2" stroke-dasharray="4 4"/>
+                        <line x1="12" y1="58" x2="60" y2="58" stroke="#e2e8f0" stroke-width="2"/>
+                        <g transform="rotate(${figureRotation} 36 50)">
+                            <circle cx="36" cy="22" r="6" fill="${color}"/>
+                            <line x1="36" y1="28" x2="36" y2="44" stroke="${color}" stroke-width="4" stroke-linecap="round"/>
+                            <line x1="26" y1="34" x2="46" y2="34" stroke="${color}" stroke-width="4" stroke-linecap="round"/>
+                            <line x1="36" y1="44" x2="28" y2="56" stroke="${color}" stroke-width="4" stroke-linecap="round"/>
+                            <line x1="36" y1="44" x2="44" y2="56" stroke="${color}" stroke-width="4" stroke-linecap="round"/>
+                        </g>
+                    </svg>
+                    <div class="orientation-meta">
+                        <span class="orientation-angle">Tilt: ${clampedTilt.toFixed(0)}° from vertical</span>
+                        <span class="orientation-caption">${state}</span>
+                    </div>
+                </div>
+            `;
+        }
+
+        const OFFLINE_GAP_MS = 300_000;
+        const TIMELINE_WINDOW_MS = 10 * 60_000;
+
+        function extractTimelineEvents() {
+            if (!selectedMac) return [];
+            const events = [];
+            const now = Date.now();
+
+            const sensorTimes = latestSensorRows
+                .map(d => d.data().received_at?.toDate?.()?.getTime?.())
+                .filter(t => typeof t === 'number')
+                .sort((a, b) => a - b);
+            if (sensorTimes.length) {
+                events.push({ time: sensorTimes[0], label: 'Online', color: '#16a34a' });
+                for (let i = 1; i < sensorTimes.length; i++) {
+                    const gap = sensorTimes[i] - sensorTimes[i - 1];
+                    if (gap > OFFLINE_GAP_MS) {
+                        events.push({ time: sensorTimes[i - 1] + OFFLINE_GAP_MS, label: 'Offline', color: '#6b7280' });
+                        events.push({ time: sensorTimes[i], label: 'Online', color: '#16a34a' });
+                    }
+                }
+                if ((now - sensorTimes[sensorTimes.length - 1]) > OFFLINE_GAP_MS) {
+                    events.push({
+                        time: sensorTimes[sensorTimes.length - 1] + OFFLINE_GAP_MS,
+                        label: 'Offline',
+                        color: '#6b7280'
+                    });
+                }
+            }
+
+            const cfg = deviceConfigs[selectedMac];
+            if (cfg?.vertical) {
+                const ascending = latestSensorRows.slice().reverse();
+                let runStart = null;
+                let fallActive = false;
+                for (const doc of ascending) {
+                    const payload = doc.data();
+                    const time = payload.received_at?.toDate?.()?.getTime?.();
+                    if (typeof time !== 'number') continue;
+                    const accel = payload.environment?.accelerometer;
+                    if (!accel || typeof accel.x !== 'number') continue;
+                    const tilt = tiltAngleDeg(accel, cfg.vertical);
+                    if (tilt == null) continue;
+                    if (tilt >= HORIZONTAL_TILT_DEG) {
+                        if (runStart == null) runStart = time;
+                        if (!fallActive && (time - runStart) >= HORIZONTAL_DURATION_MS) {
+                            events.push({ time: runStart, label: 'Fall', color: '#dc2626' });
+                            fallActive = true;
+                        }
+                    } else {
+                        if (fallActive) {
+                            events.push({ time, label: 'Fall cleared', color: '#f59e0b' });
+                        }
+                        runStart = null;
+                        fallActive = false;
+                    }
+                }
+            }
+
+            const audioColors = { safe: '#3b82f6', warning: '#f59e0b', danger: '#dc2626', error: '#6b7280' };
+            latestWarnings.forEach(doc => {
+                const w = doc.data();
+                let time = w.received_at?.toDate?.()?.getTime?.();
+                if (typeof time !== 'number' && typeof w.timestamp === 'string') {
+                    const parsed = new Date(w.timestamp).getTime();
+                    if (!isNaN(parsed)) time = parsed;
+                }
+                if (typeof time !== 'number') return;
+                const lvl = w.classification?.warning_level || 'safe';
+                events.push({ time, label: `Audio ${lvl}`, color: audioColors[lvl] || '#6b7280' });
+                if (w.cleared) {
+                    const ct = w.cleared_at?.toDate?.()?.getTime?.();
+                    if (typeof ct === 'number') {
+                        events.push({ time: ct, label: 'Audio cleared', color: '#9ca3af' });
+                    }
+                }
+            });
+
+            return events.sort((a, b) => a.time - b.time);
+        }
+
+        function renderEventTimeline() {
+            const canvas = document.getElementById('eventTimeline');
+            if (!canvas) return;
+            const ctx = canvas.getContext('2d');
+            const dpr = window.devicePixelRatio || 1;
+            const cssW = canvas.clientWidth || 800;
+            const cssH = canvas.clientHeight || 200;
+            canvas.width = Math.round(cssW * dpr);
+            canvas.height = Math.round(cssH * dpr);
+            ctx.setTransform(dpr, 0, 0, dpr, 0, 0);
+            ctx.clearRect(0, 0, cssW, cssH);
+
+            const padLeft = 12, padRight = 12, padTop = 12, padBottom = 30;
+            const plotW = cssW - padLeft - padRight;
+            const axisY = cssH - padBottom;
+
+            const events = extractTimelineEvents();
+            const now = Date.now();
+            const minTime = now - TIMELINE_WINDOW_MS;
+            const maxTime = now;
+            const span = TIMELINE_WINDOW_MS;
+
+            ctx.strokeStyle = '#cbd5e1';
+            ctx.lineWidth = 1;
+            ctx.beginPath();
+            ctx.moveTo(padLeft, axisY);
+            ctx.lineTo(cssW - padRight, axisY);
+            ctx.stroke();
+
+            ctx.font = '11px "Segoe UI", sans-serif';
+            ctx.fillStyle = '#64748b';
+            const tickCount = 6;
+            for (let i = 0; i <= tickCount; i++) {
+                const t = minTime + (span * i / tickCount);
+                const x = padLeft + (plotW * i / tickCount);
+                ctx.beginPath();
+                ctx.moveTo(x, axisY);
+                ctx.lineTo(x, axisY + 4);
+                ctx.stroke();
+                ctx.textAlign = 'center';
+                ctx.fillText(new Date(t).toLocaleTimeString([], { hour: '2-digit', minute: '2-digit' }), x, axisY + 18);
+            }
+
+            if (!selectedMac) {
+                ctx.fillStyle = '#94a3b8';
+                ctx.font = '13px "Segoe UI", sans-serif';
+                ctx.textAlign = 'center';
+                ctx.fillText('Select a device to view its event timeline.', cssW / 2, cssH / 2);
+                return;
+            }
+            if (!events.length) {
+                ctx.fillStyle = '#94a3b8';
+                ctx.font = '13px "Segoe UI", sans-serif';
+                ctx.textAlign = 'center';
+                ctx.fillText('No events for this device yet.', cssW / 2, cssH / 2);
+                return;
+            }
+
+            ctx.font = '11px "Segoe UI", sans-serif';
+            const placed = [];
+            const rowHeight = 14;
+            const labelGap = 6;
+            events.forEach(ev => {
+                if (ev.time < minTime || ev.time > maxTime) return;
+                const x = padLeft + ((ev.time - minTime) / span) * plotW;
+                const labelW = ctx.measureText(ev.label).width;
+                let row = 0;
+                while (row < 6) {
+                    const conflict = placed.some(p =>
+                        p.row === row && Math.abs(p.x - x) < (Math.max(p.labelW, labelW) / 2 + labelGap)
+                    );
+                    if (!conflict) break;
+                    row++;
+                }
+                placed.push({ x, row, labelW });
+                const labelTopY = padTop + row * rowHeight;
+                const labelBaselineY = labelTopY + 10;
+
+                ctx.strokeStyle = ev.color;
+                ctx.lineWidth = 2;
+                ctx.beginPath();
+                ctx.moveTo(x, labelBaselineY + 2);
+                ctx.lineTo(x, axisY);
+                ctx.stroke();
+
+                ctx.fillStyle = ev.color;
+                ctx.beginPath();
+                ctx.arc(x, axisY, 3, 0, Math.PI * 2);
+                ctx.fill();
+
+                ctx.fillStyle = ev.color;
+                ctx.textAlign = 'center';
+                ctx.fillText(ev.label, x, labelBaselineY);
+            });
         }
 
         function nodeName(nodeId) {
@@ -871,11 +1255,12 @@
                 const cfg = deviceConfigs[nodeId];
                 const accel = payload.environment?.accelerometer;
                 let orientationLine = 'Orientation: not calibrated';
+                let orientationTilt = null;
                 if (cfg?.vertical && accel) {
-                    const tilt = tiltAngleDeg(accel, cfg.vertical);
-                    if (tilt != null) {
-                        const label = tilt >= HORIZONTAL_TILT_DEG ? 'horizontal' : 'upright';
-                        orientationLine = `Orientation: ${label} (${tilt.toFixed(0)}° from vertical)`;
+                    orientationTilt = tiltAngleDeg(accel, cfg.vertical);
+                    if (orientationTilt != null) {
+                        const label = orientationTilt >= HORIZONTAL_TILT_DEG ? 'horizontal' : 'upright';
+                        orientationLine = `Orientation: ${label} (${orientationTilt.toFixed(0)}° from vertical)`;
                         if (horizontalSince[nodeId]) {
                             const heldFor = Math.floor((Date.now() - horizontalSince[nodeId]) / 1000);
                             orientationLine += ` · held ${heldFor}s / 30s`;
@@ -891,6 +1276,8 @@
                     <span>Last update ${elapsed}s ago · Attempts: ${payload.transmission_attempts ?? 'N/A'}</span>
                     <small>${formatTime(payload.received_at)}</small>
                     <small>${escapeHtml(orientationLine)}</small>
+                    ${orientationIndicatorHtml(orientationTilt)}
+                    ${batteryIndicatorHtml(payload)}
                     <div style="margin-top: 10px;"><span class="status-pill ${pill}">${status}</span></div>
                     <button class="calibrate-btn" data-node-id="${escapeHtml(nodeId)}">Calibrate orientation</button>
                 `;
@@ -963,11 +1350,22 @@
             sensorRows.forEach(doc => {
                 const payload = doc.data();
                 const temp = payload.environment?.temperature;
+                const nodeId = payload.node_id || 'Unknown';
                 if (typeof temp === 'number') {
                     if (temp > 80) {
-                        alerts.push({ level: 'danger', message: `${displayLabelText(payload.node_id)} temperature above 80°C` });
+                        alerts.push({
+                            level: 'danger',
+                            message: `${displayLabelText(nodeId)} temperature above 80°C`,
+                            source: 'local',
+                            alertId: `temp:${nodeId}:danger`
+                        });
                     } else if (temp > 35) {
-                        alerts.push({ level: 'warning', message: `${displayLabelText(payload.node_id)} temperature high: ${temp.toFixed(1)}°C` });
+                        alerts.push({
+                            level: 'warning',
+                            message: `${displayLabelText(nodeId)} temperature high: ${temp.toFixed(1)}°C`,
+                            source: 'local',
+                            alertId: `temp:${nodeId}:warning`
+                        });
                     }
                 }
             });
@@ -990,30 +1388,65 @@
             return alerts;
         }
 
+        const hiddenLocalAlerts = new Set();
+
+        function pruneHiddenLocalAlerts(alerts) {
+            const activeLocalIds = new Set(
+                alerts
+                    .filter(alert => alert.source === 'local' && typeof alert.alertId === 'string')
+                    .map(alert => alert.alertId)
+            );
+            Array.from(hiddenLocalAlerts).forEach(alertId => {
+                if (!activeLocalIds.has(alertId)) {
+                    hiddenLocalAlerts.delete(alertId);
+                }
+            });
+        }
+
         function renderAlertBanner(sensorRows, warningDocs) {
             const banner = document.getElementById('alertBanner');
             const alerts = computeAlertRows(sensorRows, warningDocs);
-            if (!alerts.length) {
+            pruneHiddenLocalAlerts(alerts);
+            const visibleAlerts = alerts.filter(alert => !(alert.source === 'local' && hiddenLocalAlerts.has(alert.alertId)));
+            if (!visibleAlerts.length) {
                 banner.className = 'alert-banner empty';
                 banner.textContent = 'No active alerts. System normal.';
                 return;
             }
             const order = { danger: 0, warning: 1 };
-            const sorted = alerts.slice().sort((a, b) => (order[a.level] ?? 2) - (order[b.level] ?? 2));
+            const sorted = visibleAlerts.slice().sort((a, b) => (order[a.level] ?? 2) - (order[b.level] ?? 2));
             banner.className = 'alert-banner';
             banner.innerHTML = '';
             sorted.forEach(alert => {
                 const row = document.createElement('div');
                 row.className = `alert-row ${alert.level}`;
-                const clearBtn = alert.source === 'audio' && alert.docId
-                    ? `<button class="alert-row-clear" data-doc-id="${escapeHtml(alert.docId)}" title="Clear alert" aria-label="Clear alert">&times;</button>`
-                    : '';
+                let clearBtn = '';
+                if (alert.source === 'audio' && alert.docId) {
+                    clearBtn = `<button class="alert-row-clear" data-clear-type="audio" data-doc-id="${escapeHtml(alert.docId)}" title="Clear alert" aria-label="Clear alert">&times;</button>`;
+                } else if (alert.source === 'local' && alert.alertId) {
+                    clearBtn = `<button class="alert-row-clear" data-clear-type="local" data-alert-id="${escapeHtml(alert.alertId)}" title="Hide alert" aria-label="Hide alert">&times;</button>`;
+                }
                 row.innerHTML = `<span class="alert-row-text"><span class="alert-row-level">${escapeHtml(alert.level)}</span>${escapeHtml(alert.message)}</span>${clearBtn}`;
                 banner.appendChild(row);
             });
             banner.querySelectorAll('.alert-row-clear').forEach(btn => {
-                btn.addEventListener('click', () => clearAudioAlert(btn.getAttribute('data-doc-id')));
+                btn.addEventListener('click', () => {
+                    const clearType = btn.getAttribute('data-clear-type');
+                    if (clearType === 'audio') {
+                        clearAudioAlert(btn.getAttribute('data-doc-id'));
+                        return;
+                    }
+                    if (clearType === 'local') {
+                        hideLocalAlert(btn.getAttribute('data-alert-id'));
+                    }
+                });
             });
+        }
+
+        function hideLocalAlert(alertId) {
+            if (!alertId) return;
+            hiddenLocalAlerts.add(alertId);
+            renderAlertBanner(latestSensorRows, latestWarnings);
         }
 
         async function clearAudioAlert(docId) {
@@ -1068,6 +1501,7 @@
                     miniCharts[id].update();
                 }
             });
+            renderEventTimeline();
         }
 
         function selectDevice(mac) {
@@ -1088,10 +1522,12 @@
             if (!selectedMac) {
                 clearPanels('Select a device to view its data.');
                 renderAlertBanner(latestSensorRows, latestWarnings);
+                renderEventTimeline();
                 return;
             }
             clearPanels('Loading…');
             renderAlertBanner(latestSensorRows, latestWarnings);
+            renderEventTimeline();
             iotUnsub = subscribeIotData(selectedMac);
             warningsUnsub = subscribeWarnings(selectedMac);
         }
@@ -1114,6 +1550,7 @@
                     updateDeviceStatus(latestSensorRows);
                     updateHealthLog(latestSensorRows);
                     renderAlertBanner(latestSensorRows, latestWarnings);
+                    renderEventTimeline();
                     refreshCalibrationModal();
                 }, error => {
                     console.error('Firestore iot-data error', error);
@@ -1136,6 +1573,7 @@
                     latestWarnings.sort(byReceivedAtDesc);
                     updateTranscriptionLog(latestWarnings);
                     renderAlertBanner(latestSensorRows, latestWarnings);
+                    renderEventTimeline();
                 }, error => {
                     console.error('Firestore warnings error', error);
                     document.getElementById('transcriptionLog').innerHTML = '<div class="empty-state">Unable to load transcription log.</div>';
@@ -1173,6 +1611,7 @@
                         updateHealthLog(latestSensorRows);
                         updateTranscriptionLog(latestWarnings);
                         renderAlertBanner(latestSensorRows, latestWarnings);
+                        renderEventTimeline();
                         refreshCalibrationModal();
                     }
                 }
@@ -1255,7 +1694,9 @@
                     const seconds = Math.floor(elapsed / 1000);
                     alerts.push({
                         level: 'danger',
-                        message: `${displayLabelText(nodeId)} has been horizontal for ${seconds}s — possible fall.`
+                        message: `${displayLabelText(nodeId)} has been horizontal for ${seconds}s — possible fall.`,
+                        source: 'local',
+                        alertId: `orientation:${nodeId}:horizontal`
                     });
                 }
             });
@@ -1331,7 +1772,10 @@
         setInterval(() => {
             updateDeviceStatus(latestSensorRows);
             renderAlertBanner(latestSensorRows, latestWarnings);
+            renderEventTimeline();
         }, 1000);
+
+        window.addEventListener('resize', renderEventTimeline);
 
         initMiniCharts();
         loadData();
