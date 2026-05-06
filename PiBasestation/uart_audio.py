@@ -1,6 +1,7 @@
 #!/usr/bin/env python3
 
 import argparse
+import re
 import serial
 import struct
 import time
@@ -22,17 +23,29 @@ UART_PORT = "/dev/serial0"
 BAUD_RATE = 115200
 TIMEOUT = 0.1
 
+# --- Audio processing config ---
+# Peak-normalise decoded audio before saving/transcribing.
+# Set NORMALIZE_AUDIO=0 to disable.
+NORMALIZE_AUDIO = os.getenv("NORMALIZE_AUDIO", "1").lower() not in ("0", "false", "no", "off")
+NORMALIZE_TARGET_PEAK = int(os.getenv("NORMALIZE_TARGET_PEAK", "30000"))
+NORMALIZE_MAX_GAIN = float(os.getenv("NORMALIZE_MAX_GAIN", "8.0"))
+
 # --- Firebase config ---
 FIREBASE_CREDENTIALS_PATH = os.getenv("FIREBASE_CREDENTIALS_PATH")
 FIREBASE_COLLECTION = os.getenv("FIREBASE_COLLECTION", "iot-data")
 FIREBASE_WARNINGS_COLLECTION = os.getenv("FIREBASE_WARNINGS_COLLECTION", "warnings")
+FIREBASE_WEATHER_COLLECTION = os.getenv("FIREBASE_WEATHER_COLLECTION", "weather_reference")
 FIREBASE_STORAGE_BUCKET = os.getenv("FIREBASE_STORAGE_BUCKET")
+
+METSERVICE_OBSERVATIONS_URL = "https://www.metservice.com/publicData/webdata/maps-radar/3-hourly-observations"
+METSERVICE_FETCH_INTERVAL_S = 3600  # 1 hour
 DEFAULT_SCHEMA_PATH = (
     Path(__file__).resolve().parent
     / "Advanced-IoT-Mine-Safety-Monorepo"
     / "node-data-schema.json"
 )
 SCHEMA_PATH = Path(os.getenv("SCHEMA_PATH", str(DEFAULT_SCHEMA_PATH)))
+
 
 # 19-byte packed header:
 # msg_type (0x02), node_mac[6], seq_num(uint16 LE), total_chunks(uint16 LE),
@@ -45,6 +58,12 @@ DESKTOP_DIR = Path.home() / "Desktop"
 OUTPUT_DIR = DESKTOP_DIR if DESKTOP_DIR.exists() else Path.home()
 DEBUG_DIR = OUTPUT_DIR / "uart_audio_debug"
 DEBUG_DIR.mkdir(parents=True, exist_ok=True)
+
+# --- Offline Firebase fallback config ---
+# When Firestore/Storage is unavailable, records are written here as JSON files.
+FIREBASE_FALLBACK_DIR = Path(
+    os.getenv("FIREBASE_FALLBACK_DIR", str(OUTPUT_DIR / "firebase_offline_queue"))
+)
 
 # --- OpenAI config ---
 # Set your API key via environment variable: export OPENAI_API_KEY="sk-..."
@@ -94,16 +113,195 @@ INDEX_TABLE = [
 ]
 
 
+def utc_now_iso() -> str:
+    return time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime())
+
+
+def fetch_auckland_airport_pressure():
+    """
+    Scrape MetService 3-hourly observations for Auckland Airport pressure.
+    Returns {pressure_hpa, source_url, fetched_at} on success, or None.
+    """
+    try:
+        resp = httpx.get(METSERVICE_OBSERVATIONS_URL, timeout=20.0)
+        resp.raise_for_status()
+        text = resp.text
+    except Exception as e:
+        print(f"[WEATHER] fetch failed: {e}")
+        return None
+
+    match = re.search(
+        r"Auckland\s*\(Airport\).*?(\d{3,4})\s*hPa",
+        text,
+        flags=re.DOTALL | re.IGNORECASE,
+    )
+    if not match:
+        print("[WEATHER] Auckland (Airport) pressure not found in MetService response")
+        return None
+
+    try:
+        pressure = int(match.group(1))
+    except ValueError:
+        print(f"[WEATHER] could not parse pressure value: {match.group(1)!r}")
+        return None
+
+    if not (900 <= pressure <= 1100):
+        print(f"[WEATHER] pressure value {pressure}hPa outside plausible range, ignoring")
+        return None
+
+    return {
+        "station": "Auckland (Airport)",
+        "pressure_hpa": pressure,
+        "source_url": METSERVICE_OBSERVATIONS_URL,
+        "fetched_at": utc_now_iso(),
+    }
+
+
+def update_weather_reference(firebase_client) -> bool:
+    data = fetch_auckland_airport_pressure()
+    if not data:
+        return False
+    return firebase_client.publish_weather_reference("auckland_airport", data)
+
+
+class FirebaseFallbackStore:
+    """Local append-only queue for Firebase operations that could not be sent."""
+
+    def __init__(self, queue_dir: Path):
+        self.queue_dir = queue_dir
+        self.queue_dir.mkdir(parents=True, exist_ok=True)
+        self.queue_path = self.queue_dir / "firebase_upload_queue.jsonl"
+        self.export_path = self.queue_dir / "firestore_offline_export.json"
+        self.readme_path = self.queue_dir / "README.txt"
+        self._write_readme()
+        self._refresh_export()
+
+    def _write_readme(self):
+        if self.readme_path.exists():
+            return
+        self.readme_path.write_text(
+            "Firebase offline fallback files\n"
+            "===============================\n\n"
+            "This folder is created when the Raspberry Pi cannot reach Firebase, "
+            "or when an individual Firestore/Storage operation fails.\n\n"
+            "Files:\n"
+            "- firebase_upload_queue.jsonl: append-only queue; one JSON operation per line.\n"
+            "- firestore_offline_export.json: easier-to-read export grouped by Firestore collection.\n\n"
+            "Operation types:\n"
+            "- firestore_add: add the supplied document to the named Firestore collection.\n"
+            "- storage_upload: upload the local file to the supplied Firebase Storage path.\n\n"
+            "The local queue is not deleted automatically. After uploading/importing the data, "
+            "archive or delete the queue files yourself to avoid duplicate uploads.\n",
+            encoding="utf-8",
+        )
+
+    def _json_safe(self, value):
+        if isinstance(value, Path):
+            return str(value)
+        if isinstance(value, dict):
+            return {str(k): self._json_safe(v) for k, v in value.items()}
+        if isinstance(value, list):
+            return [self._json_safe(v) for v in value]
+        if isinstance(value, tuple):
+            return [self._json_safe(v) for v in value]
+        return value
+
+    def _append(self, record: dict) -> str:
+        record = self._json_safe(record)
+        with open(self.queue_path, "a", encoding="utf-8") as f:
+            f.write(json.dumps(record, ensure_ascii=False) + "\n")
+        self._refresh_export()
+        return str(self.queue_path)
+
+    def _read_queue(self) -> list:
+        if not self.queue_path.exists():
+            return []
+        records = []
+        with open(self.queue_path, "r", encoding="utf-8") as f:
+            for line_no, line in enumerate(f, start=1):
+                line = line.strip()
+                if not line:
+                    continue
+                try:
+                    records.append(json.loads(line))
+                except json.JSONDecodeError as e:
+                    print(f"[FIREBASE-FALLBACK] skipped invalid queue line {line_no}: {e}")
+        return records
+
+    def _refresh_export(self):
+        records = self._read_queue()
+        collections = {}
+        storage_uploads = []
+        for record in records:
+            if record.get("operation") == "firestore_add":
+                collections.setdefault(record.get("collection", "unknown"), []).append(record.get("document", {}))
+            elif record.get("operation") == "storage_upload":
+                storage_uploads.append({
+                    "bucket": record.get("bucket"),
+                    "storage_path": record.get("storage_path"),
+                    "local_path": record.get("local_path"),
+                    "content_type": record.get("content_type"),
+                    "queued_at": record.get("queued_at"),
+                })
+
+        export = {
+            "generated_at": utc_now_iso(),
+            "queue_file": str(self.queue_path),
+            "collections": collections,
+            "storage_uploads": storage_uploads,
+        }
+        with open(self.export_path, "w", encoding="utf-8") as f:
+            json.dump(export, f, indent=2, ensure_ascii=False)
+
+    def queue_firestore_add(self, collection: str, document: dict, reason: str) -> str:
+        queue_file = self._append({
+            "operation": "firestore_add",
+            "collection": collection,
+            "document": document,
+            "queued_at": utc_now_iso(),
+            "reason": reason,
+        })
+        print(f"[FIREBASE-FALLBACK] queued Firestore document for '{collection}': {queue_file}")
+        return queue_file
+
+    def queue_storage_upload(
+        self,
+        local_path: Path,
+        storage_path: str,
+        content_type: str = "application/octet-stream",
+        bucket: str = None,
+        reason: str = "Firebase Storage unavailable",
+    ) -> str:
+        queue_file = self._append({
+            "operation": "storage_upload",
+            "bucket": bucket,
+            "storage_path": storage_path,
+            "local_path": str(local_path),
+            "content_type": content_type,
+            "queued_at": utc_now_iso(),
+            "reason": reason,
+        })
+        print(f"[FIREBASE-FALLBACK] queued Storage upload '{storage_path}': {queue_file}")
+        return queue_file
+
+
 class FirebaseClient:
     def __init__(self):
         self.enabled = False
+        self.firestore_online = False
+        self.storage_online = False
         self.sensor_col = None
         self.warnings_col = None
+        self.weather_col = None
         self.bucket = None
         self.schema = None
+        self.fallback = FirebaseFallbackStore(FIREBASE_FALLBACK_DIR)
+        print(f"[FIREBASE-FALLBACK] offline queue: {self.fallback.queue_path}")
+        print(f"[FIREBASE-FALLBACK] grouped export: {self.fallback.export_path}")
 
         if not FIREBASE_CREDENTIALS_PATH:
             print("[FIREBASE] disabled: FIREBASE_CREDENTIALS_PATH not set")
+            self._load_schema()
             return
 
         try:
@@ -122,6 +320,7 @@ class FirebaseClient:
             db = firestore.client()
             self.sensor_col = db.collection(FIREBASE_COLLECTION)
             self.warnings_col = db.collection(FIREBASE_WARNINGS_COLLECTION)
+            self.weather_col = db.collection(FIREBASE_WEATHER_COLLECTION)
 
             if FIREBASE_STORAGE_BUCKET:
                 self.bucket = storage.bucket()
@@ -130,16 +329,23 @@ class FirebaseClient:
 
             self._load_schema()
 
-            self.enabled = True
             print(
                 f"[FIREBASE] initialized (sensor='{FIREBASE_COLLECTION}', "
                 f"warnings='{FIREBASE_WARNINGS_COLLECTION}', "
                 f"bucket='{FIREBASE_STORAGE_BUCKET or 'none'}')"
             )
-            self._test_connection()
+            self.firestore_online, self.storage_online = self._test_connection()
+            self.enabled = self.firestore_online
+            if not self.firestore_online:
+                print("[FIREBASE] Firestore unavailable; new Firestore records will be written to the offline queue")
+            if self.bucket is not None and not self.storage_online:
+                print("[FIREBASE] Storage unavailable; new audio uploads will be written to the offline queue")
         except Exception as e:
             print(f"[FIREBASE] disabled: init failed: {e}")
+            print("[FIREBASE] new Firebase records will be written to the offline queue")
             self.enabled = False
+            self.firestore_online = False
+            self.storage_online = False
 
     def _load_schema(self):
         try:
@@ -151,7 +357,10 @@ class FirebaseClient:
             self.schema = None
 
     def _test_connection(self):
-        """Round-trip a write to Firestore and check the bucket so failures surface at startup."""
+        """Round-trip Firestore and Storage tests so failures surface at startup."""
+        firestore_ok = False
+        storage_ok = False
+
         try:
             ping_ref = self.sensor_col.document("_connection_test")
             ping_ref.set({
@@ -160,6 +369,7 @@ class FirebaseClient:
                 "tested_by": "pi-basestation",
             })
             ping_ref.delete()
+            firestore_ok = True
             print(f"[FIREBASE] [OK] Firestore reachable (write+delete to {FIREBASE_COLLECTION}/_connection_test)")
         except Exception as e:
             print(f"[FIREBASE] [FAIL] Firestore test failed: {e}")
@@ -169,42 +379,88 @@ class FirebaseClient:
             try:
                 exists = self.bucket.exists()
                 if exists:
+                    storage_ok = True
                     print(f"[FIREBASE] [OK] Storage bucket '{self.bucket.name}' reachable")
                 else:
                     print(f"[FIREBASE] [FAIL] Storage bucket '{self.bucket.name}' does not exist or is not accessible")
             except Exception as e:
                 print(f"[FIREBASE] [FAIL] Storage test failed: {e}")
 
+        return firestore_ok, storage_ok
+
+    def _sensor_document(self, payload: dict, online: bool) -> dict:
+        if online:
+            return {
+                **payload,
+                "received_at": firestore.SERVER_TIMESTAMP,
+                "received_by": "pi-basestation",
+            }
+        return {
+            **payload,
+            "received_at": utc_now_iso(),
+            "received_by": "pi-basestation",
+            "offline_queued": True,
+        }
+
+    def _warning_document(self, doc: dict, online: bool) -> dict:
+        if online:
+            return {
+                **doc,
+                "received_at": firestore.SERVER_TIMESTAMP,
+            }
+        return {
+            **doc,
+            "received_at": utc_now_iso(),
+            "offline_queued": True,
+        }
+
     def publish_sensor_payload(self, payload: dict):
         """Validate and write a parsed sensor payload. Returns (status, detail).
 
-        status is one of: "disabled", "invalid", "error", "ok".
-        For "ok", detail is the new doc id. Otherwise detail is a human-readable message.
+        status is one of: "queued", "invalid", "error", "ok".
+        For "ok", detail is the new doc id. For "queued", detail is the local queue file.
         """
-        if not self.enabled or self.sensor_col is None:
-            return ("disabled", "Firebase not enabled")
-
         if self.schema is not None:
             try:
                 validate(instance=payload, schema=self.schema)
             except ValidationError as e:
                 return ("invalid", e.message)
 
+        offline_doc = self._sensor_document(payload, online=False)
+
+        if not self.enabled or not self.firestore_online or self.sensor_col is None:
+            queue_file = self.fallback.queue_firestore_add(
+                FIREBASE_COLLECTION,
+                offline_doc,
+                "Firestore unavailable or not configured",
+            )
+            return ("queued", queue_file)
+
         try:
-            doc_ref = self.sensor_col.add({
-                **payload,
-                "received_at": firestore.SERVER_TIMESTAMP,
-                "received_by": "pi-basestation",
-            })
+            doc_ref = self.sensor_col.add(self._sensor_document(payload, online=True))
             return ("ok", doc_ref[1].id)
         except Exception as e:
-            return ("error", str(e))
+            queue_file = self.fallback.queue_firestore_add(
+                FIREBASE_COLLECTION,
+                offline_doc,
+                f"Firestore write failed: {e}",
+            )
+            return ("queued", queue_file)
 
     def upload_wav(self, wav_path: Path, mac_compact: str):
-        if not self.enabled or self.bucket is None:
-            return None
+        blob_path = f"audio/{mac_compact}/{wav_path.name}"
+
+        if not self.storage_online or self.bucket is None:
+            self.fallback.queue_storage_upload(
+                wav_path,
+                blob_path,
+                content_type="audio/wav",
+                bucket=FIREBASE_STORAGE_BUCKET,
+                reason="Firebase Storage unavailable or not configured",
+            )
+            return blob_path, None
+
         try:
-            blob_path = f"audio/{mac_compact}/{wav_path.name}"
             blob = self.bucket.blob(blob_path)
             blob.upload_from_filename(str(wav_path), content_type="audio/wav")
             blob.make_public()
@@ -212,22 +468,55 @@ class FirebaseClient:
             return blob_path, blob.public_url
         except Exception as e:
             print(f"[FIREBASE] audio upload failed: {e}")
-            return None
+            self.fallback.queue_storage_upload(
+                wav_path,
+                blob_path,
+                content_type="audio/wav",
+                bucket=getattr(self.bucket, "name", FIREBASE_STORAGE_BUCKET),
+                reason=f"Firebase Storage upload failed: {e}",
+            )
+            return blob_path, None
 
     def publish_warning(self, doc: dict):
-        if not self.enabled or self.warnings_col is None:
-            return None
+        offline_doc = self._warning_document(doc, online=False)
+
+        if not self.enabled or not self.firestore_online or self.warnings_col is None:
+            queue_file = self.fallback.queue_firestore_add(
+                FIREBASE_WARNINGS_COLLECTION,
+                offline_doc,
+                "Firestore unavailable or not configured",
+            )
+            print(f"[FIREBASE] warning doc queued locally: {queue_file}")
+            return "queued", queue_file
+
         try:
-            doc_ref = self.warnings_col.add({
-                **doc,
-                "received_at": firestore.SERVER_TIMESTAMP,
-            })
+            doc_ref = self.warnings_col.add(self._warning_document(doc, online=True))
             doc_id = doc_ref[1].id
             print(f"[FIREBASE] warning doc written: {FIREBASE_WARNINGS_COLLECTION}/{doc_id}")
-            return doc_id
+            return "ok", doc_id
         except Exception as e:
             print(f"[FIREBASE] warning write failed: {e}")
-            return None
+            queue_file = self.fallback.queue_firestore_add(
+                FIREBASE_WARNINGS_COLLECTION,
+                offline_doc,
+                f"Firestore warning write failed: {e}",
+            )
+            print(f"[FIREBASE] warning doc queued locally: {queue_file}")
+            return "queued", queue_file
+
+    def publish_weather_reference(self, doc_id: str, doc: dict):
+        if not self.enabled or not self.firestore_online or self.weather_col is None:
+            print(f"[WEATHER] Firestore unavailable; skipping weather_reference/{doc_id}")
+            return False
+        try:
+            payload = dict(doc)
+            payload["received_at"] = firestore.SERVER_TIMESTAMP
+            self.weather_col.document(doc_id).set(payload, merge=True)
+            print(f"[WEATHER] {FIREBASE_WEATHER_COLLECTION}/{doc_id} updated: pressure={doc.get('pressure_hpa')}hPa")
+            return True
+        except Exception as e:
+            print(f"[WEATHER] write failed for {doc_id}: {e}")
+            return False
 
 
 @dataclass
@@ -301,6 +590,36 @@ def decode_ima_adpcm(adpcm):
             pcm.append(predictor)
 
     return struct.pack("<" + "h" * len(pcm), *pcm)
+
+
+def normalize_pcm_16le(pcm_data: bytes, target_peak: int = NORMALIZE_TARGET_PEAK, max_gain: float = NORMALIZE_MAX_GAIN):
+    """Peak-normalise signed 16-bit little-endian mono PCM without clipping.
+
+    Returns (normalised_pcm, gain, original_peak).
+    """
+    if not pcm_data or len(pcm_data) < 2:
+        return pcm_data, 1.0, 0
+
+    sample_count = len(pcm_data) // 2
+    pcm_data = pcm_data[:sample_count * 2]
+    samples = struct.unpack("<" + "h" * sample_count, pcm_data)
+    original_peak = max(abs(sample) for sample in samples)
+
+    if original_peak == 0:
+        return pcm_data, 1.0, 0
+
+    target_peak = max(1, min(int(target_peak), 32767))
+    gain = min(target_peak / original_peak, max_gain)
+
+    # Do not reduce already-loud audio. This is mainly to lift quiet clips for transcription.
+    if gain <= 1.0:
+        return pcm_data, 1.0, original_peak
+
+    normalised = [
+        max(-32768, min(32767, int(round(sample * gain))))
+        for sample in samples
+    ]
+    return struct.pack("<" + "h" * sample_count, *normalised), gain, original_peak
 
 
 def transcribe_audio(wav_path: Path) -> str:
@@ -423,8 +742,8 @@ class UARTAudioMonitor:
         status, detail = self.firebase.publish_sensor_payload(payload)
         if status == "ok":
             print(f"[SENSOR]   -> Firestore OK: {FIREBASE_COLLECTION}/{detail}")
-        elif status == "disabled":
-            print(f"[SENSOR]   -> not submitted ({detail})")
+        elif status == "queued":
+            print(f"[SENSOR]   -> queued locally for Firebase upload: {detail}")
         elif status == "invalid":
             print(f"[SENSOR]   -> schema validation failed: {detail}")
         elif status == "error":
@@ -530,6 +849,21 @@ class UARTAudioMonitor:
             with open(pcm_dump_path, "wb") as f:
                 f.write(pcm)
 
+            normalisation_gain = 1.0
+            normalisation_peak = 0
+            if NORMALIZE_AUDIO:
+                pcm, normalisation_gain, normalisation_peak = normalize_pcm_16le(pcm)
+                normalised_pcm_dump_path = session.session_dir / "decoded_pcm_normalised.raw"
+                with open(normalised_pcm_dump_path, "wb") as f:
+                    f.write(pcm)
+                print(
+                    f"[AUDIO] Normalised PCM: peak={normalisation_peak}, "
+                    f"gain={normalisation_gain:.2f}x, target_peak={NORMALIZE_TARGET_PEAK}"
+                )
+            else:
+                normalised_pcm_dump_path = None
+                print("[AUDIO] PCM normalisation disabled")
+
             out_path = write_wav_file(
                 node_mac=session.node_mac,
                 sample_rate=session.sample_rate,
@@ -539,6 +873,11 @@ class UARTAudioMonitor:
             with open(session.info_path, "a", encoding="utf-8") as f:
                 f.write(f"assembled_adpcm={assembled_adpcm_path}\n")
                 f.write(f"decoded_pcm={pcm_dump_path}\n")
+                if normalised_pcm_dump_path is not None:
+                    f.write(f"decoded_pcm_normalised={normalised_pcm_dump_path}\n")
+                f.write(f"normalise_audio={NORMALIZE_AUDIO}\n")
+                f.write(f"normalisation_peak={normalisation_peak}\n")
+                f.write(f"normalisation_gain={normalisation_gain:.4f}\n")
                 f.write(f"wav_file={out_path}\n")
 
             print(f"[AUDIO] Complete from {mac_key}")
@@ -589,8 +928,12 @@ class UARTAudioMonitor:
                     "classification": classification,
                     "sample_rate": session.sample_rate,
                     "total_samples": session.total_samples,
+                    "audio_normalised": NORMALIZE_AUDIO,
+                    "audio_normalisation_gain": normalisation_gain,
+                    "audio_original_peak": normalisation_peak,
                     "audio_storage_path": storage_info[0] if storage_info else None,
                     "audio_download_url": storage_info[1] if storage_info else None,
+                    "audio_local_path": str(out_path),
                 }
                 self.firebase.publish_warning(warning_doc)
             else:
@@ -692,8 +1035,13 @@ def main():
     print(f"Listening on {UART_PORT} at {BAUD_RATE} baud...")
     print(f"Audio files will be saved to: {OUTPUT_DIR}")
     print(f"Raw packet dumps will be saved to: {DEBUG_DIR}")
+    print(f"Firebase offline queue will be saved to: {FIREBASE_FALLBACK_DIR}")
 
     monitor = UARTAudioMonitor(firebase_client)
+
+    print("[WEATHER] fetching initial Auckland (Airport) pressure...")
+    update_weather_reference(firebase_client)
+    next_weather_fetch = time.time() + METSERVICE_FETCH_INTERVAL_S
 
     try:
         while True:
@@ -703,6 +1051,10 @@ def main():
                 monitor.process_buffer()
 
             monitor.cleanup_stale_sessions()
+
+            if time.time() >= next_weather_fetch:
+                update_weather_reference(firebase_client)
+                next_weather_fetch = time.time() + METSERVICE_FETCH_INTERVAL_S
     except KeyboardInterrupt:
         print("\nStopping.")
     finally:

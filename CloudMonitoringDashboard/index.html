@@ -70,6 +70,31 @@
             font-weight: 600;
         }
 
+        .top-bar-right {
+            display: flex;
+            flex-direction: column;
+            align-items: flex-end;
+            gap: 8px;
+        }
+
+        .device-select {
+            padding: 10px 14px;
+            background: #ffffff;
+            border-radius: 999px;
+            border: 1px solid #d1d5db;
+            color: #111827;
+            font-weight: 600;
+            font-size: 13px;
+            font-family: inherit;
+            cursor: pointer;
+            min-width: 240px;
+        }
+
+        .device-select:disabled {
+            opacity: 0.6;
+            cursor: not-allowed;
+        }
+
         .status-dot {
             width: 10px;
             height: 10px;
@@ -83,30 +108,91 @@
 
         .alert-banner {
             border-radius: 16px;
-            padding: 16px 20px;
-            display: flex;
-            align-items: center;
-            gap: 12px;
             margin-bottom: 20px;
-            border: 1px solid transparent;
+            display: flex;
+            flex-direction: column;
+            gap: 6px;
+            max-height: 180px;
+            overflow-y: auto;
+            padding: 8px;
+            background: #f8fafc;
+            border: 1px solid rgba(148, 163, 184, 0.18);
         }
 
-        .alert-banner.normal {
+        .alert-banner.empty {
+            padding: 16px 20px;
             background: #eff6ff;
             color: #1d4ed8;
             border-color: #bfdbfe;
+            flex-direction: row;
+            align-items: center;
         }
 
-        .alert-banner.warning {
+        .alert-row {
+            border-radius: 10px;
+            padding: 10px 14px;
+            border: 1px solid transparent;
+            font-size: 14px;
+            line-height: 1.4;
+            display: flex;
+            align-items: center;
+            gap: 10px;
+        }
+
+        .alert-row .alert-row-text {
+            flex: 1;
+        }
+
+        .alert-row .alert-row-clear {
+            background: transparent;
+            border: 0;
+            color: inherit;
+            font-size: 18px;
+            line-height: 1;
+            font-weight: 700;
+            cursor: pointer;
+            opacity: 0.6;
+            padding: 4px 8px;
+            border-radius: 6px;
+            flex-shrink: 0;
+        }
+
+        .alert-row .alert-row-clear:hover {
+            opacity: 1;
+            background: rgba(0, 0, 0, 0.06);
+        }
+
+        .alert-row.warning {
             background: #fffbeb;
             color: #92400e;
             border-color: #fde68a;
         }
 
-        .alert-banner.danger {
+        .alert-row.danger {
             background: #fef2f2;
             color: #b91c1c;
             border-color: #fecaca;
+        }
+
+        .alert-row .alert-row-level {
+            font-weight: 700;
+            text-transform: uppercase;
+            letter-spacing: 0.08em;
+            font-size: 11px;
+            margin-right: 8px;
+        }
+
+        .alert-banner::-webkit-scrollbar {
+            width: 7px;
+        }
+
+        .alert-banner::-webkit-scrollbar-track {
+            background: transparent;
+        }
+
+        .alert-banner::-webkit-scrollbar-thumb {
+            background: rgba(100, 116, 139, 0.4);
+            border-radius: 999px;
         }
 
         .log-card.warning-warning {
@@ -308,12 +394,138 @@
             font-size: 13px;
         }
 
+        .node-mac {
+            font-size: 11px;
+            color: #64748b;
+            font-weight: 400;
+            margin-left: 6px;
+        }
+
         @media (max-width: 980px) {
 
             .summary-grid,
             .main-grid {
                 grid-template-columns: 1fr;
             }
+        }
+
+        .calibrate-btn {
+            margin-top: 8px;
+            padding: 6px 10px;
+            font-size: 12px;
+            font-weight: 600;
+            border-radius: 8px;
+            border: 1px solid #cbd5e1;
+            background: #ffffff;
+            color: #0f172a;
+            cursor: pointer;
+        }
+
+        .calibrate-btn:hover {
+            background: #f1f5f9;
+        }
+
+        .modal-overlay {
+            position: fixed;
+            inset: 0;
+            background: rgba(15, 23, 42, 0.55);
+            display: none;
+            align-items: center;
+            justify-content: center;
+            z-index: 1000;
+            padding: 20px;
+        }
+
+        .modal-overlay.open {
+            display: flex;
+        }
+
+        .modal {
+            background: #ffffff;
+            border-radius: 20px;
+            padding: 24px;
+            max-width: 460px;
+            width: 100%;
+            box-shadow: 0 22px 60px rgba(15, 23, 42, 0.3);
+        }
+
+        .modal h2 {
+            margin: 0 0 6px;
+            font-size: 18px;
+            color: #0f172a;
+        }
+
+        .modal .modal-sub {
+            margin: 0 0 16px;
+            color: #64748b;
+            font-size: 12px;
+        }
+
+        .calib-row {
+            display: flex;
+            justify-content: space-between;
+            gap: 12px;
+            padding: 10px 12px;
+            background: #f8fafc;
+            border-radius: 10px;
+            margin-bottom: 8px;
+            font-size: 13px;
+            font-family: 'Consolas', 'Courier New', monospace;
+        }
+
+        .calib-row .calib-label {
+            color: #64748b;
+            font-family: 'Segoe UI', sans-serif;
+            font-weight: 600;
+        }
+
+        .calib-row .calib-tilt {
+            color: #1d4ed8;
+            font-family: 'Segoe UI', sans-serif;
+            font-weight: 600;
+        }
+
+        .modal-buttons {
+            display: flex;
+            gap: 8px;
+            margin-top: 14px;
+            flex-wrap: wrap;
+        }
+
+        .modal-buttons button {
+            flex: 1;
+            min-width: 120px;
+            padding: 10px 12px;
+            border-radius: 10px;
+            border: 1px solid #cbd5e1;
+            background: #ffffff;
+            color: #0f172a;
+            font-weight: 600;
+            font-size: 13px;
+            cursor: pointer;
+        }
+
+        .modal-buttons button.primary {
+            background: #2563eb;
+            color: #ffffff;
+            border-color: #2563eb;
+        }
+
+        .modal-buttons button.primary:hover {
+            background: #1d4ed8;
+        }
+
+        .modal-buttons button:hover {
+            background: #f1f5f9;
+        }
+
+        .modal-buttons button.primary:hover {
+            background: #1d4ed8;
+        }
+
+        .modal-buttons button:disabled {
+            opacity: 0.5;
+            cursor: not-allowed;
         }
     </style>
 </head>
@@ -326,13 +538,18 @@
                 <p>Realtime sensor view for temperature, humidity, pressure, node status, and audio/transcription
                     alerts.</p>
             </div>
-            <div class="status-chip" id="connectionChip">
-                <span id="connectionDot" class="status-dot"></span>
-                <span id="connectionText">Connecting to Firebase...</span>
+            <div class="top-bar-right">
+                <select id="deviceSelect" class="device-select" disabled>
+                    <option>Loading devices…</option>
+                </select>
+                <div class="status-chip" id="connectionChip">
+                    <span id="connectionDot" class="status-dot"></span>
+                    <span id="connectionText">Connecting to Firebase...</span>
+                </div>
             </div>
         </div>
 
-        <div id="alertBanner" class="alert-banner normal">No active alerts. System normal.</div>
+        <div id="alertBanner" class="alert-banner empty">No active alerts. System normal.</div>
 
         <div class="summary-grid">
             <div class="card">
@@ -350,7 +567,7 @@
             <div class="card">
                 <h2>Elevation / Pressure</h2>
                 <div class="value" id="elevStat">-- m</div>
-                <div class="subtitle">Latest node reading</div>
+                <div class="subtitle" id="elevSubtitle">Ref: 1013.25 hPa (default)</div>
                 <canvas id="elevMiniChart" class="mini-chart"></canvas>
             </div>
         </div>
@@ -388,6 +605,34 @@
                 <div id="deviceStatus" class="status-list scroll-panel">
                     <div class="empty-state">Loading device status…</div>
                 </div>
+            </div>
+        </div>
+    </div>
+
+    <div id="calibrationModal" class="modal-overlay" role="dialog" aria-modal="true">
+        <div class="modal">
+            <h2>Calibrate orientation — <span id="calibNodeId">--</span></h2>
+            <p class="modal-sub">Hold the device upright and click <strong>Save vertical</strong>, then lay it flat and click <strong>Save horizontal</strong>. The latest sensor reading is captured at the moment you click.</p>
+            <div class="calib-row">
+                <span class="calib-label">Live reading</span>
+                <span id="calibLive">waiting for data…</span>
+            </div>
+            <div class="calib-row">
+                <span class="calib-label">Saved vertical</span>
+                <span id="calibVertical">not set</span>
+            </div>
+            <div class="calib-row">
+                <span class="calib-label">Saved horizontal</span>
+                <span id="calibHorizontal">not set</span>
+            </div>
+            <div class="calib-row">
+                <span class="calib-label">Current tilt from vertical</span>
+                <span id="calibTilt" class="calib-tilt">--</span>
+            </div>
+            <div class="modal-buttons">
+                <button id="calibSaveVertical" class="primary">Save vertical</button>
+                <button id="calibSaveHorizontal" class="primary">Save horizontal</button>
+                <button id="calibClose">Close</button>
             </div>
         </div>
     </div>
@@ -443,6 +688,79 @@
             return div.innerHTML;
         }
 
+        const HORIZONTAL_TILT_DEG = 60;
+        const HORIZONTAL_DURATION_MS = 30000;
+        const deviceConfigs = {};
+        const horizontalSince = {};
+        const latestPerNode = {};
+        let currentCalibratingMac = null;
+
+        function vecMag(v) {
+            return Math.sqrt(v.x * v.x + v.y * v.y + v.z * v.z);
+        }
+
+        function vecDot(a, b) {
+            return a.x * b.x + a.y * b.y + a.z * b.z;
+        }
+
+        function tiltAngleDeg(current, reference) {
+            if (!current || !reference) return null;
+            const m1 = vecMag(current);
+            const m2 = vecMag(reference);
+            if (m1 === 0 || m2 === 0) return null;
+            let cos = vecDot(current, reference) / (m1 * m2);
+            if (cos > 1) cos = 1;
+            if (cos < -1) cos = -1;
+            return Math.acos(cos) * 180 / Math.PI;
+        }
+
+        function fmtVec(v) {
+            if (!v || typeof v.x !== 'number') return 'not set';
+            return `x=${v.x.toFixed(2)}  y=${v.y.toFixed(2)}  z=${v.z.toFixed(2)}`;
+        }
+
+        const DEFAULT_SEA_LEVEL_HPA = 1013.25;
+        let weatherReference = null;
+
+        function referencePressureHpa() {
+            const p = weatherReference?.pressure_hpa;
+            return typeof p === 'number' && p > 0 ? p : DEFAULT_SEA_LEVEL_HPA;
+        }
+
+        function pressureToElevation(pressureHpa) {
+            if (typeof pressureHpa !== 'number' || pressureHpa <= 0) return null;
+            const p0 = referencePressureHpa();
+            return 44330 * (1 - Math.pow(pressureHpa / p0, 1 / 5.255));
+        }
+
+        function deriveElevation(env) {
+            if (!env) return null;
+            if (typeof env.elevation === 'number') return env.elevation;
+            if (typeof env.barometric_pressure === 'number') return pressureToElevation(env.barometric_pressure);
+            return null;
+        }
+
+        function nodeName(nodeId) {
+            const cfg = nodeId ? deviceConfigs[nodeId] : null;
+            const name = cfg?.name;
+            return typeof name === 'string' && name.trim() ? name.trim() : null;
+        }
+
+        function displayLabelHtml(nodeId) {
+            const id = nodeId || 'Unknown';
+            const name = nodeName(id);
+            if (name) {
+                return `${escapeHtml(name)}<span class="node-mac">(${escapeHtml(id)})</span>`;
+            }
+            return escapeHtml(id);
+        }
+
+        function displayLabelText(nodeId) {
+            const id = nodeId || 'Unknown';
+            const name = nodeName(id);
+            return name ? `${name} (${id})` : id;
+        }
+
         function initMiniCharts() {
             const defs = [
                 { id: 'tempMiniChart', color: 'rgb(239, 68, 68)' },
@@ -466,8 +784,8 @@
             dot.className = connected ? 'status-dot' : 'status-dot offline';
             text.textContent = connected ? 'Connected to Firebase' : 'Disconnected from Firebase';
             if (!connected) {
-                banner.className = 'alert-banner danger';
-                banner.textContent = 'Connection lost. Data may be stale.';
+                banner.className = 'alert-banner';
+                banner.innerHTML = '<div class="alert-row danger"><span class="alert-row-level">danger</span>Connection lost. Data may be stale.</div>';
             }
         }
 
@@ -481,7 +799,7 @@
             const labels = sorted.map((_, idx) => idx + 1);
             const temps = sorted.map(doc => doc.data().environment?.temperature ?? 0);
             const humids = sorted.map(doc => doc.data().environment?.humidity ?? 0);
-            const elevs = sorted.map(doc => doc.data().environment?.elevation ?? doc.data().environment?.barometric_pressure ?? 0);
+            const elevs = sorted.map(doc => deriveElevation(doc.data().environment) ?? 0);
             miniCharts.tempMiniChart.data.labels = labels;
             miniCharts.tempMiniChart.data.datasets[0].data = temps;
             miniCharts.tempMiniChart.update();
@@ -514,12 +832,12 @@
                 const env = entry.payload.environment || {};
                 const temp = env.temperature ?? 0;
                 const humid = env.humidity ?? 0;
-                const elev = env.elevation ?? env.barometric_pressure ?? 0;
+                const elev = deriveElevation(env) ?? 0;
                 const severity = temp > 35 ? 'danger' : temp > 30 ? 'warning' : 'online';
                 const card = document.createElement('div');
                 card.className = 'status-card';
                 card.innerHTML = `
-                    <strong>${nodeId}</strong>
+                    <strong>${displayLabelHtml(nodeId)}</strong>
                     <span>${temp.toFixed(1)}°C · ${humid.toFixed(0)}% · ${elev.toFixed(0)} m</span>
                     <small>Last seen ${formatTime(entry.payload.received_at)}</small>
                     <div style="margin-top: 10px;"><span class="status-pill ${severity === 'online' ? 'pill-online' : severity === 'warning' ? 'pill-warning' : 'pill-danger'}">${severity === 'online' ? 'Normal' : severity === 'warning' ? 'Warning' : 'Danger'}</span></div>
@@ -550,15 +868,36 @@
                 let pill = 'pill-online';
                 if (elapsed > 300) { status = 'Offline'; pill = 'pill-danger'; }
                 else if (payload.environment?.temperature > 35) { status = 'Warning'; pill = 'pill-warning'; }
+                const cfg = deviceConfigs[nodeId];
+                const accel = payload.environment?.accelerometer;
+                let orientationLine = 'Orientation: not calibrated';
+                if (cfg?.vertical && accel) {
+                    const tilt = tiltAngleDeg(accel, cfg.vertical);
+                    if (tilt != null) {
+                        const label = tilt >= HORIZONTAL_TILT_DEG ? 'horizontal' : 'upright';
+                        orientationLine = `Orientation: ${label} (${tilt.toFixed(0)}° from vertical)`;
+                        if (horizontalSince[nodeId]) {
+                            const heldFor = Math.floor((Date.now() - horizontalSince[nodeId]) / 1000);
+                            orientationLine += ` · held ${heldFor}s / 30s`;
+                        }
+                    }
+                } else if (cfg?.vertical && !accel) {
+                    orientationLine = 'Orientation: no accelerometer data';
+                }
                 const card = document.createElement('div');
                 card.className = 'status-card';
                 card.innerHTML = `
-                    <strong>${nodeId}</strong>
+                    <strong>${displayLabelHtml(nodeId)}</strong>
                     <span>Last update ${elapsed}s ago · Attempts: ${payload.transmission_attempts ?? 'N/A'}</span>
                     <small>${formatTime(payload.received_at)}</small>
+                    <small>${escapeHtml(orientationLine)}</small>
                     <div style="margin-top: 10px;"><span class="status-pill ${pill}">${status}</span></div>
+                    <button class="calibrate-btn" data-node-id="${escapeHtml(nodeId)}">Calibrate orientation</button>
                 `;
                 section.appendChild(card);
+            });
+            section.querySelectorAll('.calibrate-btn').forEach(btn => {
+                btn.addEventListener('click', () => openCalibrationModal(btn.getAttribute('data-node-id')));
             });
         }
 
@@ -580,7 +919,7 @@
                 const card = document.createElement('div');
                 card.className = 'log-card';
                 card.innerHTML = `
-                    <strong>${formatTime(payload.received_at)} · ${payload.node_id || 'Unknown'}</strong>
+                    <strong>${formatTime(payload.received_at)} · ${displayLabelHtml(payload.node_id)}</strong>
                     <span>${level}: ${temp.toFixed(1)}°C, ${humid.toFixed(0)}% humidity</span>
                     <small>Transmission attempts: ${payload.transmission_attempts ?? 'N/A'}</small>
                     <div style="margin-top: 10px;"><span class="status-pill ${pill}">${level}</span></div>
@@ -609,7 +948,7 @@
                     ? `<audio controls preload="none" src="${encodeURI(audioUrl)}"></audio>`
                     : '';
                 card.innerHTML = `
-                    <strong>${escapeHtml(nodeId)} <span class="status-pill ${pillFor(level)}">${escapeHtml(level)}</span></strong>
+                    <strong>${displayLabelHtml(nodeId)} <span class="status-pill ${pillFor(level)}">${escapeHtml(level)}</span></strong>
                     <span>"${escapeHtml(transcript)}"</span>
                     ${reasoning ? `<small class="reasoning">${escapeHtml(reasoning)}</small>` : ''}
                     ${audioHtml}
@@ -626,24 +965,28 @@
                 const temp = payload.environment?.temperature;
                 if (typeof temp === 'number') {
                     if (temp > 80) {
-                        alerts.push({ level: 'danger', message: `${payload.node_id || 'Unknown'} temperature above 80°C` });
+                        alerts.push({ level: 'danger', message: `${displayLabelText(payload.node_id)} temperature above 80°C` });
                     } else if (temp > 35) {
-                        alerts.push({ level: 'warning', message: `${payload.node_id || 'Unknown'} temperature high: ${temp.toFixed(1)}°C` });
+                        alerts.push({ level: 'warning', message: `${displayLabelText(payload.node_id)} temperature high: ${temp.toFixed(1)}°C` });
                     }
                 }
             });
             warningDocs.slice(0, 5).forEach(doc => {
                 const w = doc.data();
+                if (w.cleared === true) return;
                 const lvl = w.classification?.warning_level;
                 if (lvl === 'danger' || lvl === 'warning') {
-                    const node = w.node_id || w.mac_address || 'Node';
+                    const node = w.node_id || w.mac_address;
                     const snippet = (w.transcript || '').slice(0, 80);
                     alerts.push({
                         level: lvl,
-                        message: `${node} audio alert: "${snippet}"`
+                        message: `${displayLabelText(node)} audio alert: "${snippet}"`,
+                        source: 'audio',
+                        docId: doc.id
                     });
                 }
             });
+            computeOrientationAlerts().forEach(a => alerts.push(a));
             return alerts;
         }
 
@@ -651,48 +994,344 @@
             const banner = document.getElementById('alertBanner');
             const alerts = computeAlertRows(sensorRows, warningDocs);
             if (!alerts.length) {
-                banner.className = 'alert-banner normal';
+                banner.className = 'alert-banner empty';
                 banner.textContent = 'No active alerts. System normal.';
                 return;
             }
-            const highest = alerts.find(alert => alert.level === 'danger') || alerts[0];
-            banner.className = `alert-banner ${highest.level}`;
-            banner.textContent = highest.message;
+            const order = { danger: 0, warning: 1 };
+            const sorted = alerts.slice().sort((a, b) => (order[a.level] ?? 2) - (order[b.level] ?? 2));
+            banner.className = 'alert-banner';
+            banner.innerHTML = '';
+            sorted.forEach(alert => {
+                const row = document.createElement('div');
+                row.className = `alert-row ${alert.level}`;
+                const clearBtn = alert.source === 'audio' && alert.docId
+                    ? `<button class="alert-row-clear" data-doc-id="${escapeHtml(alert.docId)}" title="Clear alert" aria-label="Clear alert">&times;</button>`
+                    : '';
+                row.innerHTML = `<span class="alert-row-text"><span class="alert-row-level">${escapeHtml(alert.level)}</span>${escapeHtml(alert.message)}</span>${clearBtn}`;
+                banner.appendChild(row);
+            });
+            banner.querySelectorAll('.alert-row-clear').forEach(btn => {
+                btn.addEventListener('click', () => clearAudioAlert(btn.getAttribute('data-doc-id')));
+            });
+        }
+
+        async function clearAudioAlert(docId) {
+            if (!docId) return;
+            try {
+                await db.collection('warnings').doc(docId).update({
+                    cleared: true,
+                    cleared_at: firebase.firestore.FieldValue.serverTimestamp()
+                });
+            } catch (err) {
+                console.error('Failed to clear audio alert', err);
+            }
         }
 
         let latestSensorRows = [];
         let latestWarnings = [];
+        let selectedMac = localStorage.getItem('selectedMac') || null;
+        let iotUnsub = null;
+        let warningsUnsub = null;
+        let firstDeviceConfigSnapshot = true;
 
-        function loadData() {
-            db.collection('iot-data').orderBy('received_at', 'desc').limit(100).onSnapshot(snapshot => {
-                updateConnection(true);
-                latestSensorRows = [];
-                snapshot.forEach(doc => latestSensorRows.push(doc));
-                latestSensorRows.sort(byReceivedAtDesc);
-                updateMiniStats(latestSensorRows);
-                updateEnvironmentStatus(latestSensorRows);
-                updateDeviceStatus(latestSensorRows);
-                updateHealthLog(latestSensorRows);
-                renderAlertBanner(latestSensorRows, latestWarnings);
-            }, error => {
-                console.error('Firestore iot-data error', error);
-                updateConnection(false);
-                document.getElementById('environmentStatus').innerHTML = '<div class="empty-state">Unable to load environment data.</div>';
-                document.getElementById('deviceStatus').innerHTML = '<div class="empty-state">Unable to load device status.</div>';
-                document.getElementById('healthLog').innerHTML = '<div class="empty-state">Unable to load health log.</div>';
+        function rebuildDeviceDropdown() {
+            const select = document.getElementById('deviceSelect');
+            const macs = Object.keys(deviceConfigs).sort((a, b) => {
+                const an = nodeName(a) || a;
+                const bn = nodeName(b) || b;
+                return an.localeCompare(bn);
             });
+            if (!macs.length) {
+                select.innerHTML = '<option value="">No calibrated devices</option>';
+                select.disabled = true;
+                return;
+            }
+            select.disabled = false;
+            select.innerHTML = macs.map(mac =>
+                `<option value="${escapeHtml(mac)}"${mac === selectedMac ? ' selected' : ''}>${escapeHtml(displayLabelText(mac))}</option>`
+            ).join('');
+        }
 
-            db.collection('warnings').orderBy('received_at', 'desc').limit(50).onSnapshot(snapshot => {
-                latestWarnings = [];
-                snapshot.forEach(doc => latestWarnings.push(doc));
-                latestWarnings.sort(byReceivedAtDesc);
-                updateTranscriptionLog(latestWarnings);
-                renderAlertBanner(latestSensorRows, latestWarnings);
-            }, error => {
-                console.error('Firestore warnings error', error);
-                document.getElementById('transcriptionLog').innerHTML = '<div class="empty-state">Unable to load transcription log.</div>';
+        function clearPanels(message) {
+            document.getElementById('environmentStatus').innerHTML = `<div class="empty-state">${escapeHtml(message)}</div>`;
+            document.getElementById('deviceStatus').innerHTML = `<div class="empty-state">${escapeHtml(message)}</div>`;
+            document.getElementById('healthLog').innerHTML = `<div class="empty-state">${escapeHtml(message)}</div>`;
+            document.getElementById('transcriptionLog').innerHTML = `<div class="empty-state">${escapeHtml(message)}</div>`;
+            document.getElementById('tempStat').textContent = '--°C';
+            document.getElementById('humidStat').textContent = '--%';
+            document.getElementById('elevStat').textContent = '-- m';
+            ['tempMiniChart', 'humidMiniChart', 'elevMiniChart'].forEach(id => {
+                if (miniCharts[id]) {
+                    miniCharts[id].data.labels = [];
+                    miniCharts[id].data.datasets[0].data = [];
+                    miniCharts[id].update();
+                }
             });
         }
+
+        function selectDevice(mac) {
+            if (iotUnsub) { iotUnsub(); iotUnsub = null; }
+            if (warningsUnsub) { warningsUnsub(); warningsUnsub = null; }
+            selectedMac = mac || null;
+            if (selectedMac) {
+                localStorage.setItem('selectedMac', selectedMac);
+            } else {
+                localStorage.removeItem('selectedMac');
+            }
+            latestSensorRows = [];
+            latestWarnings = [];
+            Object.keys(latestPerNode).forEach(k => delete latestPerNode[k]);
+            Object.keys(horizontalSince).forEach(k => delete horizontalSince[k]);
+            const select = document.getElementById('deviceSelect');
+            if (select && selectedMac) select.value = selectedMac;
+            if (!selectedMac) {
+                clearPanels('Select a device to view its data.');
+                renderAlertBanner(latestSensorRows, latestWarnings);
+                return;
+            }
+            clearPanels('Loading…');
+            renderAlertBanner(latestSensorRows, latestWarnings);
+            iotUnsub = subscribeIotData(selectedMac);
+            warningsUnsub = subscribeWarnings(selectedMac);
+        }
+
+        function subscribeIotData(mac) {
+            return db.collection('iot-data')
+                .where('node_id', '==', mac)
+                .orderBy('received_at', 'desc')
+                .limit(100)
+                .onSnapshot(snapshot => {
+                    if (mac !== selectedMac) return;
+                    updateConnection(true);
+                    latestSensorRows = [];
+                    snapshot.forEach(doc => latestSensorRows.push(doc));
+                    latestSensorRows.sort(byReceivedAtDesc);
+                    updateLatestPerNode(latestSensorRows);
+                    updateOrientationState();
+                    updateMiniStats(latestSensorRows);
+                    updateEnvironmentStatus(latestSensorRows);
+                    updateDeviceStatus(latestSensorRows);
+                    updateHealthLog(latestSensorRows);
+                    renderAlertBanner(latestSensorRows, latestWarnings);
+                    refreshCalibrationModal();
+                }, error => {
+                    console.error('Firestore iot-data error', error);
+                    updateConnection(false);
+                    document.getElementById('environmentStatus').innerHTML = '<div class="empty-state">Unable to load environment data.</div>';
+                    document.getElementById('deviceStatus').innerHTML = '<div class="empty-state">Unable to load device status.</div>';
+                    document.getElementById('healthLog').innerHTML = '<div class="empty-state">Unable to load health log.</div>';
+                });
+        }
+
+        function subscribeWarnings(mac) {
+            return db.collection('warnings')
+                .where('node_id', '==', mac)
+                .orderBy('received_at', 'desc')
+                .limit(50)
+                .onSnapshot(snapshot => {
+                    if (mac !== selectedMac) return;
+                    latestWarnings = [];
+                    snapshot.forEach(doc => latestWarnings.push(doc));
+                    latestWarnings.sort(byReceivedAtDesc);
+                    updateTranscriptionLog(latestWarnings);
+                    renderAlertBanner(latestSensorRows, latestWarnings);
+                }, error => {
+                    console.error('Firestore warnings error', error);
+                    document.getElementById('transcriptionLog').innerHTML = '<div class="empty-state">Unable to load transcription log.</div>';
+                });
+        }
+
+        function subscribeDeviceConfig() {
+            db.collection('device_config').onSnapshot(snapshot => {
+                updateConnection(true);
+                snapshot.docChanges().forEach(change => {
+                    const id = change.doc.id;
+                    if (change.type === 'removed') {
+                        delete deviceConfigs[id];
+                    } else {
+                        deviceConfigs[id] = change.doc.data();
+                    }
+                });
+                rebuildDeviceDropdown();
+                if (firstDeviceConfigSnapshot) {
+                    firstDeviceConfigSnapshot = false;
+                    const macs = Object.keys(deviceConfigs);
+                    let initial = selectedMac;
+                    if (!initial || !deviceConfigs[initial]) {
+                        initial = macs[0] || null;
+                    }
+                    selectDevice(initial);
+                } else {
+                    if (selectedMac && !deviceConfigs[selectedMac]) {
+                        const macs = Object.keys(deviceConfigs);
+                        selectDevice(macs[0] || null);
+                    } else {
+                        updateOrientationState();
+                        updateEnvironmentStatus(latestSensorRows);
+                        updateDeviceStatus(latestSensorRows);
+                        updateHealthLog(latestSensorRows);
+                        updateTranscriptionLog(latestWarnings);
+                        renderAlertBanner(latestSensorRows, latestWarnings);
+                        refreshCalibrationModal();
+                    }
+                }
+            }, error => {
+                console.error('Firestore device_config error', error);
+            });
+        }
+
+        document.getElementById('deviceSelect').addEventListener('change', e => {
+            selectDevice(e.target.value || null);
+        });
+
+        function subscribeWeatherReference() {
+            db.collection('weather_reference').doc('auckland_airport').onSnapshot(snap => {
+                if (snap.exists) {
+                    weatherReference = snap.data();
+                    const subtitle = document.getElementById('elevSubtitle');
+                    if (subtitle) {
+                        subtitle.textContent = `Ref: ${weatherReference.pressure_hpa} hPa (Auckland Airport)`;
+                    }
+                    if (latestSensorRows.length) {
+                        updateMiniStats(latestSensorRows);
+                        updateEnvironmentStatus(latestSensorRows);
+                    }
+                }
+            }, error => {
+                console.error('Firestore weather_reference error', error);
+            });
+        }
+
+        function loadData() {
+            subscribeDeviceConfig();
+            subscribeWeatherReference();
+        }
+
+        function updateLatestPerNode(rows) {
+            rows.forEach(doc => {
+                const payload = doc.data();
+                const nodeId = payload.node_id;
+                if (!nodeId) return;
+                const time = payload.received_at?.toDate?.()?.getTime?.() || 0;
+                if (!latestPerNode[nodeId] || time > latestPerNode[nodeId].time) {
+                    latestPerNode[nodeId] = { payload, time };
+                }
+            });
+        }
+
+        function updateOrientationState() {
+            const now = Date.now();
+            Object.entries(latestPerNode).forEach(([nodeId, entry]) => {
+                const cfg = deviceConfigs[nodeId];
+                if (!cfg || !cfg.vertical) {
+                    delete horizontalSince[nodeId];
+                    return;
+                }
+                const accel = entry.payload.environment?.accelerometer;
+                if (!accel || typeof accel.x !== 'number') return;
+                const tilt = tiltAngleDeg(accel, cfg.vertical);
+                if (tilt == null) return;
+                if (tilt >= HORIZONTAL_TILT_DEG) {
+                    if (!horizontalSince[nodeId]) {
+                        const sampleTime = entry.time || now;
+                        horizontalSince[nodeId] = Math.min(sampleTime, now);
+                    }
+                } else {
+                    delete horizontalSince[nodeId];
+                }
+            });
+            Object.keys(horizontalSince).forEach(nodeId => {
+                if (!latestPerNode[nodeId]) delete horizontalSince[nodeId];
+            });
+        }
+
+        function computeOrientationAlerts() {
+            const now = Date.now();
+            const alerts = [];
+            Object.entries(horizontalSince).forEach(([nodeId, since]) => {
+                const elapsed = now - since;
+                if (elapsed >= HORIZONTAL_DURATION_MS) {
+                    const seconds = Math.floor(elapsed / 1000);
+                    alerts.push({
+                        level: 'danger',
+                        message: `${displayLabelText(nodeId)} has been horizontal for ${seconds}s — possible fall.`
+                    });
+                }
+            });
+            return alerts;
+        }
+
+        function openCalibrationModal(nodeId) {
+            currentCalibratingMac = nodeId;
+            document.getElementById('calibNodeId').innerHTML = displayLabelHtml(nodeId);
+            document.getElementById('calibrationModal').classList.add('open');
+            refreshCalibrationModal();
+        }
+
+        function closeCalibrationModal() {
+            currentCalibratingMac = null;
+            document.getElementById('calibrationModal').classList.remove('open');
+        }
+
+        function refreshCalibrationModal() {
+            if (!currentCalibratingMac) return;
+            const nodeId = currentCalibratingMac;
+            document.getElementById('calibNodeId').innerHTML = displayLabelHtml(nodeId);
+            const entry = latestPerNode[nodeId];
+            const accel = entry?.payload?.environment?.accelerometer;
+            const cfg = deviceConfigs[nodeId];
+            const liveEl = document.getElementById('calibLive');
+            const vEl = document.getElementById('calibVertical');
+            const hEl = document.getElementById('calibHorizontal');
+            const tiltEl = document.getElementById('calibTilt');
+            const saveVBtn = document.getElementById('calibSaveVertical');
+            const saveHBtn = document.getElementById('calibSaveHorizontal');
+            liveEl.textContent = accel ? fmtVec(accel) : 'waiting for data…';
+            vEl.textContent = cfg?.vertical ? fmtVec(cfg.vertical) : 'not set';
+            hEl.textContent = cfg?.horizontal ? fmtVec(cfg.horizontal) : 'not set';
+            const canSave = !!accel;
+            saveVBtn.disabled = !canSave;
+            saveHBtn.disabled = !canSave;
+            if (accel && cfg?.vertical) {
+                const t = tiltAngleDeg(accel, cfg.vertical);
+                tiltEl.textContent = t == null ? '--' : `${t.toFixed(1)}°`;
+            } else {
+                tiltEl.textContent = accel ? 'calibrate vertical first' : '--';
+            }
+        }
+
+        async function saveCalibration(field) {
+            if (!currentCalibratingMac) return;
+            const entry = latestPerNode[currentCalibratingMac];
+            const accel = entry?.payload?.environment?.accelerometer;
+            if (!accel) {
+                console.warn('No live reading available to save');
+                return;
+            }
+            const update = {
+                mac_address: currentCalibratingMac,
+                [field]: { x: accel.x, y: accel.y, z: accel.z },
+                calibrated_at: firebase.firestore.FieldValue.serverTimestamp()
+            };
+            try {
+                await db.collection('device_config').doc(currentCalibratingMac).set(update, { merge: true });
+            } catch (err) {
+                console.error('Failed to save calibration', err);
+            }
+        }
+
+        document.getElementById('calibSaveVertical').addEventListener('click', () => saveCalibration('vertical'));
+        document.getElementById('calibSaveHorizontal').addEventListener('click', () => saveCalibration('horizontal'));
+        document.getElementById('calibClose').addEventListener('click', closeCalibrationModal);
+        document.getElementById('calibrationModal').addEventListener('click', (e) => {
+            if (e.target.id === 'calibrationModal') closeCalibrationModal();
+        });
+
+        setInterval(() => {
+            updateDeviceStatus(latestSensorRows);
+            renderAlertBanner(latestSensorRows, latestWarnings);
+        }, 1000);
 
         initMiniCharts();
         loadData();
