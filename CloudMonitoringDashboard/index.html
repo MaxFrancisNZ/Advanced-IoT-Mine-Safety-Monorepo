@@ -780,6 +780,20 @@
             return timestamp.toDate().toLocaleTimeString([], { hour: '2-digit', minute: '2-digit', second: '2-digit' });
         }
 
+        function formatElapsed(ms) {
+            const total = Math.max(0, Math.floor(ms / 1000));
+            const days = Math.floor(total / 86400);
+            const hours = Math.floor((total % 86400) / 3600);
+            const minutes = Math.floor((total % 3600) / 60);
+            const seconds = total % 60;
+            const parts = [];
+            if (days) parts.push(`${days}d`);
+            if (days || hours) parts.push(`${hours}h`);
+            if (days || hours || minutes) parts.push(`${minutes}m`);
+            parts.push(`${seconds}s`);
+            return parts.join(' ');
+        }
+
         function formatWarningTime(w) {
             if (w.received_at?.toDate) {
                 return w.received_at.toDate().toLocaleTimeString([], { hour: '2-digit', minute: '2-digit', second: '2-digit' });
@@ -1247,7 +1261,8 @@
             section.innerHTML = '';
             Object.entries(latest).forEach(([nodeId, entry]) => {
                 const payload = entry.payload;
-                const elapsed = Math.round((now - entry.time) / 1000);
+                const elapsedMs = now - entry.time;
+                const elapsed = Math.round(elapsedMs / 1000);
                 let status = 'Online';
                 let pill = 'pill-online';
                 if (elapsed > 300) { status = 'Offline'; pill = 'pill-danger'; }
@@ -1262,8 +1277,7 @@
                         const label = orientationTilt >= HORIZONTAL_TILT_DEG ? 'horizontal' : 'upright';
                         orientationLine = `Orientation: ${label} (${orientationTilt.toFixed(0)}° from vertical)`;
                         if (horizontalSince[nodeId]) {
-                            const heldFor = Math.floor((Date.now() - horizontalSince[nodeId]) / 1000);
-                            orientationLine += ` · held ${heldFor}s / 30s`;
+                            orientationLine += ` · held ${formatElapsed(Date.now() - horizontalSince[nodeId])} / 30s`;
                         }
                     }
                 } else if (cfg?.vertical && !accel) {
@@ -1273,7 +1287,7 @@
                 card.className = 'status-card';
                 card.innerHTML = `
                     <strong>${displayLabelHtml(nodeId)}</strong>
-                    <span>Last update ${elapsed}s ago · Attempts: ${payload.transmission_attempts ?? 'N/A'}</span>
+                    <span>Last update ${formatElapsed(elapsedMs)} ago · Attempts: ${payload.transmission_attempts ?? 'N/A'}</span>
                     <small>${formatTime(payload.received_at)}</small>
                     <small>${escapeHtml(orientationLine)}</small>
                     ${orientationIndicatorHtml(orientationTilt)}
@@ -1691,10 +1705,9 @@
             Object.entries(horizontalSince).forEach(([nodeId, since]) => {
                 const elapsed = now - since;
                 if (elapsed >= HORIZONTAL_DURATION_MS) {
-                    const seconds = Math.floor(elapsed / 1000);
                     alerts.push({
                         level: 'danger',
-                        message: `${displayLabelText(nodeId)} has been horizontal for ${seconds}s — possible fall.`,
+                        message: `${displayLabelText(nodeId)} has been horizontal for ${formatElapsed(elapsed)} — possible fall.`,
                         source: 'local',
                         alertId: `orientation:${nodeId}:horizontal`
                     });
