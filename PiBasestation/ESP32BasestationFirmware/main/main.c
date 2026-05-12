@@ -145,47 +145,120 @@ static void espnow_to_uart_task(void *pvParameters)
     }
 }
 
+/* Pi -> wearable command framing: [0xAA 0x55 len_lo len_hi payload crc8].
+ * payload is forwarded verbatim as an ESP-NOW broadcast so the targeted
+ * wearable receives it. crc8 is computed over len_lo..end-of-payload using
+ * polynomial 0x07 (CRC-8/CCITT). */
+#define FRAME_SYNC1   0xAA
+#define FRAME_SYNC2   0x55
+#define FRAME_MAX_PAYLOAD ESP_NOW_MAX_DATA_LEN_V2
+
+static uint8_t crc8_07(const uint8_t *data, size_t len)
+{
+    uint8_t crc = 0x00;
+    for (size_t i = 0; i < len; i++) {
+        crc ^= data[i];
+        for (int b = 0; b < 8; b++) {
+            crc = (crc & 0x80) ? (uint8_t)((crc << 1) ^ 0x07) : (uint8_t)(crc << 1);
+        }
+    }
+    return crc;
+}
+
+typedef enum {
+    FRAME_STATE_SYNC1 = 0,
+    FRAME_STATE_SYNC2,
+    FRAME_STATE_LEN_LO,
+    FRAME_STATE_LEN_HI,
+    FRAME_STATE_PAYLOAD,
+    FRAME_STATE_CRC,
+} frame_state_t;
+
 static void uart_to_espnow_task(void *pvParameters)
 {
-    uint8_t rx_byte = 0;
-    char line_buf[MAX_JSON_LEN + 1];
-    size_t line_len = 0;
+    (void)pvParameters;
+
+    uint8_t rx_buf[64];
+    static uint8_t payload[FRAME_MAX_PAYLOAD];
+    static uint8_t header[2];  /* len_lo, len_hi for CRC scope */
+
+    frame_state_t state = FRAME_STATE_SYNC1;
+    size_t expected_len = 0;
+    size_t got_len = 0;
 
     while (1) {
-        int read_len = uart_read_bytes(UART_BRIDGE_PORT, &rx_byte, 1, pdMS_TO_TICKS(100));
-        if (read_len <= 0) {
+        int n = uart_read_bytes(UART_BRIDGE_PORT, rx_buf, sizeof(rx_buf), pdMS_TO_TICKS(100));
+        if (n <= 0) {
             continue;
         }
 
-        if (rx_byte == '\r') {
-            continue;
-        }
+        for (int i = 0; i < n; i++) {
+            uint8_t b = rx_buf[i];
 
-        if (rx_byte == '\n') {
-            if (line_len == 0) {
-                continue;
+            switch (state) {
+            case FRAME_STATE_SYNC1:
+                if (b == FRAME_SYNC1) {
+                    state = FRAME_STATE_SYNC2;
+                }
+                break;
+            case FRAME_STATE_SYNC2:
+                if (b == FRAME_SYNC2) {
+                    state = FRAME_STATE_LEN_LO;
+                } else if (b == FRAME_SYNC1) {
+                    /* stay armed on the new SYNC1 */
+                    state = FRAME_STATE_SYNC2;
+                } else {
+                    state = FRAME_STATE_SYNC1;
+                }
+                break;
+            case FRAME_STATE_LEN_LO:
+                header[0] = b;
+                state = FRAME_STATE_LEN_HI;
+                break;
+            case FRAME_STATE_LEN_HI:
+                header[1] = b;
+                expected_len = (size_t)header[0] | ((size_t)header[1] << 8);
+                if (expected_len == 0 || expected_len > FRAME_MAX_PAYLOAD) {
+                    ESP_LOGW(TAG, "Frame length out of range: %u", (unsigned)expected_len);
+                    state = FRAME_STATE_SYNC1;
+                    break;
+                }
+                got_len = 0;
+                state = FRAME_STATE_PAYLOAD;
+                break;
+            case FRAME_STATE_PAYLOAD:
+                payload[got_len++] = b;
+                if (got_len == expected_len) {
+                    state = FRAME_STATE_CRC;
+                }
+                break;
+            case FRAME_STATE_CRC: {
+                /* CRC covers len_lo, len_hi, then payload. */
+                uint8_t crc = crc8_07(header, sizeof(header));
+                /* Continue the CRC over the payload */
+                for (size_t k = 0; k < expected_len; k++) {
+                    uint8_t bb = payload[k];
+                    crc ^= bb;
+                    for (int j = 0; j < 8; j++) {
+                        crc = (crc & 0x80) ? (uint8_t)((crc << 1) ^ 0x07) : (uint8_t)(crc << 1);
+                    }
+                }
+                if (crc != b) {
+                    ESP_LOGW(TAG, "Frame CRC mismatch (got 0x%02X, want 0x%02X, len=%u)",
+                             b, crc, (unsigned)expected_len);
+                } else {
+                    esp_err_t err = esp_now_send(ESPNOW_BROADCAST_ADDR, payload, expected_len);
+                    if (err != ESP_OK) {
+                        ESP_LOGE(TAG, "ESP-NOW broadcast failed: %s", esp_err_to_name(err));
+                    } else {
+                        ESP_LOGI(TAG, "Forwarded %u-byte command to wearables (msg_type=0x%02X)",
+                                 (unsigned)expected_len, payload[0]);
+                    }
+                }
+                state = FRAME_STATE_SYNC1;
+                break;
             }
-
-            // TODO: Re-enable UART->ESP-NOW forwarding when ready
-            // esp_err_t err = esp_now_send(ESPNOW_BROADCAST_ADDR, (const uint8_t *)line_buf, line_len);
-            // if (err != ESP_OK) {
-            //     ESP_LOGE(TAG, "ESP-NOW send failed: %s", esp_err_to_name(err));
-            // } else {
-            //     line_buf[line_len] = '\0';
-            //     ESP_LOGI(TAG, "Sent %u UART bytes over ESP-NOW: %s", (unsigned)line_len, line_buf);
-            // }
-            line_buf[line_len] = '\0';
-            ESP_LOGW(TAG, "UART->ESP-NOW disabled, dropped %u bytes: %s", (unsigned)line_len, line_buf);
-
-            line_len = 0;
-            continue;
-        }
-
-        if (line_len < MAX_JSON_LEN) {
-            line_buf[line_len++] = (char)rx_byte;
-        } else {
-            ESP_LOGW(TAG, "Dropping oversized UART line");
-            line_len = 0;
+            }
         }
     }
 }

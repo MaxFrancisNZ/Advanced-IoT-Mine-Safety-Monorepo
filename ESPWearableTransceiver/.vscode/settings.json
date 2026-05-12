@@ -15,7 +15,8 @@
     "--compile-commands-dir=c:\\Users\\Josh\\Desktop\\uni proj iot\\Advanced-IoT-Mine-Safety-Monorepo\\ESPWearableTransceiver\\build"
   ],
   "idf.flashType": "UART",
-  "idf.monitorPort": "COM6",
+  "idf.monitorPort": "/dev/tty.usbserial-0001",
   "idf.flashBaudRate": "57600",
-  "idf.monitorBaudRate": "57600"
+  "idf.monitorBaudRate": "57600",
+  "idf.port": "/dev/tty.usbserial-0001"
 }

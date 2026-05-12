@@ -1,7 +1,9 @@
 {
   "permissions": {
     "allow": [
-      "Bash(python -c \"import ast; ast.parse\\(open\\(r'c:/Users/Josh/Desktop/uni proj iot/uart_audio.py', encoding='utf-8'\\).read\\(\\)\\); print\\('syntax OK'\\)\")"
+      "Bash(python -c \"import ast; ast.parse\\(open\\(r'c:/Users/Josh/Desktop/uni proj iot/uart_audio.py', encoding='utf-8'\\).read\\(\\)\\); print\\('syntax OK'\\)\")",
+      "Bash(ls -la /Users/joshuafrost/Desktop/iot/Advanced-IoT-Mine-Safety-Monorepo/)",
+      "Read(//Users/joshuafrost/Desktop/iot/Advanced-IoT-Mine-Safety-Monorepo/**)"
     ]
   }
 }

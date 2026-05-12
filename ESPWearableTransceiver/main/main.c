@@ -72,6 +72,13 @@
 #define QUEUE_FLUSH_DELAY_MS 50
 #define QUEUE_RETRY_DELAY_MS 250
 
+#define AUDIO_CHUNK_FILE_PREFIX     "aud_"
+#define AUDIO_SESSION_MAX_PENDING   4
+#define AUDIO_SESSION_DEADLINE_MS   30000
+#define AUDIO_SESSION_QUIET_MS      5000
+#define AUDIO_INTER_CHUNK_DELAY_MS  5
+#define SESSION_NVS_BOOT_CTR_KEY    "boot_ctr"
+
 /* Application configuration */
 #define SEND_INTERVAL_MS 5000
 static const char *TAG = "ESPNOW_TX";
@@ -100,6 +107,20 @@ static volatile TickType_t s_sync_local_tick = 0;
 static portMUX_TYPE        s_time_sync_mux   = portMUX_INITIALIZER_UNLOCKED;
 
 static volatile bool s_offline_mode = false;
+
+typedef struct {
+    bool       in_use;
+    uint32_t   session_id;
+    uint16_t   total_chunks;
+    TickType_t started_tick;
+    TickType_t last_activity_tick;
+} pending_audio_session_t;
+
+static pending_audio_session_t s_pending_sessions[AUDIO_SESSION_MAX_PENDING] = {0};
+static portMUX_TYPE s_pending_sessions_mux = portMUX_INITIALIZER_UNLOCKED;
+
+static uint16_t s_session_id_boot_ctr = 0;
+static uint16_t s_session_id_next_low = 0;
 
 #define OFFLINE_MAX_AUDIO_RECORDINGS 5U
 #define OFFLINE_NVS_NAMESPACE "wearable"
@@ -144,6 +165,21 @@ static bool button_held_at_boot(void);
 static bool probe_basestation_for(uint32_t timeout_ms);
 static size_t count_queued_audio_recordings(void);
 static esp_err_t drop_oldest_audio_recording(void);
+static void audio_chunk_path(char *buf, size_t buf_len, uint32_t session_id, uint16_t seq_num);
+static bool parse_audio_chunk_name(const char *name, uint32_t *out_sid, uint16_t *out_seq);
+static esp_err_t init_session_id_generator(void);
+static uint32_t next_session_id(void);
+static bool pending_session_register(uint32_t session_id, uint16_t total_chunks);
+static bool pending_session_touch(uint32_t session_id);
+static bool pending_session_remove(uint32_t session_id);
+static size_t pending_session_count(void);
+static void delete_session_files(uint32_t session_id);
+static void retransmit_session_chunk(uint32_t session_id, uint16_t seq_num);
+static void retransmit_session_all(uint32_t session_id);
+static void handle_audio_nack(const uint8_t *data, int len);
+static void handle_audio_ack(const uint8_t *data, int len);
+static void audio_session_monitor_task(void *pvParameters);
+static void audio_recovery_scan_on_boot(void);
 
 static void log_sensor_error(const char *sensor_name, esp_err_t err)
 {
@@ -171,12 +207,33 @@ static void normalize_json_string(const uint8_t *data, int len, char *buffer, si
 
 static const char *queue_kind_prefix(queue_kind_t kind)
 {
-    return kind == QUEUE_KIND_AUDIO ? "audio_" : "sensor_";
+    return kind == QUEUE_KIND_AUDIO ? AUDIO_CHUNK_FILE_PREFIX : "sensor_";
 }
 
 static uint32_t *queue_kind_next_seq(queue_kind_t kind)
 {
     return kind == QUEUE_KIND_AUDIO ? &s_next_audio_seq : &s_next_sensor_seq;
+}
+
+static void audio_chunk_path(char *buf, size_t buf_len, uint32_t session_id, uint16_t seq_num)
+{
+    snprintf(buf, buf_len, STORAGE_BASE_PATH "/" AUDIO_CHUNK_FILE_PREFIX "%08" PRIX32 "_%05u.bin",
+             session_id, (unsigned)seq_num);
+}
+
+static bool parse_audio_chunk_name(const char *name, uint32_t *out_sid, uint16_t *out_seq)
+{
+    uint32_t sid = 0;
+    unsigned seq = 0;
+    if (sscanf(name, AUDIO_CHUNK_FILE_PREFIX "%08" SCNx32 "_%05u.bin", &sid, &seq) != 2) {
+        return false;
+    }
+    if (seq > UINT16_MAX) {
+        return false;
+    }
+    if (out_sid != NULL) *out_sid = sid;
+    if (out_seq != NULL) *out_seq = (uint16_t)seq;
+    return true;
 }
 
 static esp_err_t init_persistent_queue(void)
@@ -212,9 +269,7 @@ static esp_err_t refresh_queue_sequence_counters(void)
     DIR *dir = opendir(STORAGE_SCAN_PATH);
     struct dirent *entry = NULL;
     uint32_t max_sensor_seq = 0;
-    uint32_t max_audio_seq = 0;
     bool sensor_found = false;
-    bool audio_found = false;
 
     if (dir == NULL) {
         ESP_LOGE(TAG, "Failed to open queue storage directory: errno=%d", errno);
@@ -229,20 +284,14 @@ static esp_err_t refresh_queue_sequence_counters(void)
                 max_sensor_seq = seq;
                 sensor_found = true;
             }
-            continue;
         }
-
-        if (sscanf(entry->d_name, "audio_%" SCNu32 ".bin", &seq) == 1) {
-            if (!audio_found || seq > max_audio_seq) {
-                max_audio_seq = seq;
-                audio_found = true;
-            }
-        }
+        /* Audio chunks are addressed by (session_id, seq_num) embedded in their
+         * filenames and do not use a monotonic queue counter. */
     }
 
     closedir(dir);
     s_next_sensor_seq = sensor_found ? (max_sensor_seq + 1U) : 0U;
-    s_next_audio_seq = audio_found ? (max_audio_seq + 1U) : 0U;
+    s_next_audio_seq = 0U;  /* unused under the per-session naming scheme */
 
     ESP_LOGI(TAG, "Recovered queued packets: %u audio, %u sensor",
              (unsigned)count_queued_packets(QUEUE_KIND_AUDIO),
@@ -254,15 +303,26 @@ static esp_err_t enqueue_packet(queue_kind_t kind, const uint8_t *data, size_t l
 {
     char path[STORAGE_PATH_MAX];
     FILE *file = NULL;
-    uint32_t seq = 0;
     size_t written = 0;
 
     if (data == NULL || len == 0U || len > STORAGE_READ_BUFFER_MAX) {
         return ESP_ERR_INVALID_ARG;
     }
 
-    seq = *queue_kind_next_seq(kind);
-    snprintf(path, sizeof(path), STORAGE_BASE_PATH "/%s%" PRIu32 ".bin", queue_kind_prefix(kind), seq);
+    if (kind == QUEUE_KIND_AUDIO) {
+        if (len < AUDIO_CHUNK_HDR_SIZE) {
+            return ESP_ERR_INVALID_ARG;
+        }
+        const audio_chunk_header_t *hdr = (const audio_chunk_header_t *)data;
+        if (hdr->msg_type != AUDIO_MSG_TYPE) {
+            return ESP_ERR_INVALID_ARG;
+        }
+        audio_chunk_path(path, sizeof(path), hdr->session_id, hdr->seq_num);
+    } else {
+        uint32_t seq = *queue_kind_next_seq(kind);
+        snprintf(path, sizeof(path), STORAGE_BASE_PATH "/%s%" PRIu32 ".bin",
+                 queue_kind_prefix(kind), seq);
+    }
 
     file = fopen(path, "wb");
     if (file == NULL) {
@@ -284,11 +344,15 @@ static esp_err_t enqueue_packet(queue_kind_t kind, const uint8_t *data, size_t l
         return ESP_FAIL;
     }
 
-    (*queue_kind_next_seq(kind))++;
-    ESP_LOGI(TAG, "Queued %s packet %" PRIu32 " (%u bytes)",
-             kind == QUEUE_KIND_AUDIO ? "audio" : "sensor",
-             seq,
-             (unsigned)len);
+    if (kind == QUEUE_KIND_AUDIO) {
+        const audio_chunk_header_t *hdr = (const audio_chunk_header_t *)data;
+        ESP_LOGI(TAG, "Queued audio chunk sid=%08" PRIX32 " seq=%u (%u bytes)",
+                 hdr->session_id, (unsigned)hdr->seq_num, (unsigned)len);
+    } else {
+        uint32_t seq = *queue_kind_next_seq(kind);
+        (*queue_kind_next_seq(kind))++;
+        ESP_LOGI(TAG, "Queued sensor packet %" PRIu32 " (%u bytes)", seq, (unsigned)len);
+    }
     return ESP_OK;
 }
 
@@ -296,21 +360,48 @@ static bool find_oldest_packet_path(queue_kind_t kind, char *path, size_t path_l
 {
     DIR *dir = NULL;
     struct dirent *entry = NULL;
-    uint32_t oldest_seq = UINT32_MAX;
     bool found = false;
-    char pattern[32];
 
     if (path == NULL || path_len == 0U) {
         return false;
     }
 
-    snprintf(pattern, sizeof(pattern), "%s%%" SCNu32 ".bin", queue_kind_prefix(kind));
     dir = opendir(STORAGE_SCAN_PATH);
     if (dir == NULL) {
         ESP_LOGE(TAG, "Failed to open queue directory: errno=%d", errno);
         return false;
     }
 
+    if (kind == QUEUE_KIND_AUDIO) {
+        /* Audio chunks are named aud_<sid:08X>_<seq:05u>.bin. Lexicographic
+         * min picks the oldest session, then the lowest seq within it. */
+        char oldest_name[32] = {0};
+        while ((entry = readdir(dir)) != NULL) {
+            uint32_t sid = 0;
+            uint16_t seq = 0;
+            if (!parse_audio_chunk_name(entry->d_name, &sid, &seq)) {
+                continue;
+            }
+            if (!found || strcmp(entry->d_name, oldest_name) < 0) {
+                strncpy(oldest_name, entry->d_name, sizeof(oldest_name) - 1U);
+                oldest_name[sizeof(oldest_name) - 1U] = '\0';
+                found = true;
+            }
+        }
+        closedir(dir);
+        if (!found) {
+            return false;
+        }
+        snprintf(path, path_len, STORAGE_BASE_PATH "/%s", oldest_name);
+        if (out_seq != NULL) {
+            *out_seq = 0U;  /* not meaningful for audio; caller can re-parse */
+        }
+        return true;
+    }
+
+    char pattern[32];
+    uint32_t oldest_seq = UINT32_MAX;
+    snprintf(pattern, sizeof(pattern), "%s%%" SCNu32 ".bin", queue_kind_prefix(kind));
     while ((entry = readdir(dir)) != NULL) {
         uint32_t seq = 0;
 
@@ -343,6 +434,16 @@ static size_t count_queued_packets(queue_kind_t kind)
         return 0U;
     }
 
+    if (kind == QUEUE_KIND_AUDIO) {
+        while ((entry = readdir(dir)) != NULL) {
+            if (parse_audio_chunk_name(entry->d_name, NULL, NULL)) {
+                count++;
+            }
+        }
+        closedir(dir);
+        return count;
+    }
+
     snprintf(pattern, sizeof(pattern), "%s%%" SCNu32 ".bin", queue_kind_prefix(kind));
     while ((entry = readdir(dir)) != NULL) {
         uint32_t seq = 0;
@@ -371,11 +472,12 @@ static bool flush_next_queued_packet(uint32_t *failed_transmission_attempts)
         return false;
     }
 
-    if (!find_oldest_packet_path(QUEUE_KIND_AUDIO, path, sizeof(path), &seq)) {
-        kind = QUEUE_KIND_SENSOR;
-        if (!find_oldest_packet_path(kind, path, sizeof(path), &seq)) {
-            return true;
-        }
+    /* Audio chunks are owned by the session lifecycle (initial send +
+     * retransmit on NACK/timeout); the generic queue flusher only drains
+     * sensor packets. */
+    kind = QUEUE_KIND_SENSOR;
+    if (!find_oldest_packet_path(kind, path, sizeof(path), &seq)) {
+        return true;
     }
 
     file = fopen(path, "rb");
@@ -449,24 +551,15 @@ static bool flush_next_queued_packet(uint32_t *failed_transmission_attempts)
 
 static bool flush_persistent_queues(uint32_t *failed_transmission_attempts)
 {
-    while (true) {
-        bool queue_had_packets = count_queued_packets(QUEUE_KIND_AUDIO) > 0U ||
-                                 count_queued_packets(QUEUE_KIND_SENSOR) > 0U;
-        if (!queue_had_packets) {
-            return true;
-        }
-
-        queue_kind_t next_kind = count_queued_packets(QUEUE_KIND_AUDIO) > 0U ?
-                                 QUEUE_KIND_AUDIO : QUEUE_KIND_SENSOR;
+    /* Only sensor packets are drained here. Audio chunks are owned by the
+     * session lifecycle (initial send happens inline; retransmits happen
+     * via NACK/timeout in audio_session_monitor_task). */
+    while (count_queued_packets(QUEUE_KIND_SENSOR) > 0U) {
         if (!flush_next_queued_packet(failed_transmission_attempts)) {
             return false;
         }
-
-        vTaskDelay(pdMS_TO_TICKS(next_kind == QUEUE_KIND_AUDIO ?
-                                 AUDIO_QUEUE_FLUSH_DELAY_MS :
-                                 QUEUE_FLUSH_DELAY_MS));
+        vTaskDelay(pdMS_TO_TICKS(QUEUE_FLUSH_DELAY_MS));
     }
-
     return true;
 }
 
@@ -536,6 +629,20 @@ static void handle_base_station_message(const uint8_t *mac_addr, const uint8_t *
 
     if (mac_addr == NULL || data == NULL || len <= 0) {
         return;
+    }
+
+    /* Binary control messages from the basestation are dispatched on first
+     * byte (msg_type). They are sent as broadcasts; ignore the peer-MAC
+     * check that JSON commands honour. */
+    switch (data[0]) {
+    case AUDIO_NACK_MSG_TYPE:
+        handle_audio_nack(data, len);
+        return;
+    case AUDIO_ACK_MSG_TYPE:
+        handle_audio_ack(data, len);
+        return;
+    default:
+        break;
     }
 
     if (memcmp(mac_addr, base_station_mac, sizeof(base_station_mac)) != 0) {
@@ -684,91 +791,509 @@ static bool read_audio_chunk_header_from_path(const char *path, audio_chunk_head
 
 static size_t count_queued_audio_recordings(void)
 {
+    /* A "recording" is one session_id. Count distinct session_ids on disk. */
     DIR *dir = opendir(STORAGE_SCAN_PATH);
     if (dir == NULL) {
         return 0;
     }
 
-    size_t recordings = 0;
+    uint32_t seen[AUDIO_SESSION_MAX_PENDING * 2] = {0};
+    size_t seen_count = 0;
     struct dirent *entry = NULL;
-    char path[STORAGE_PATH_MAX];
 
     while ((entry = readdir(dir)) != NULL) {
-        uint32_t seq = 0;
-        if (sscanf(entry->d_name, "audio_%" SCNu32 ".bin", &seq) != 1) {
+        uint32_t sid = 0;
+        if (!parse_audio_chunk_name(entry->d_name, &sid, NULL)) {
             continue;
         }
 
-        if (!build_storage_entry_path(path, sizeof(path), entry->d_name)) {
-            continue;
+        bool already = false;
+        for (size_t i = 0; i < seen_count; i++) {
+            if (seen[i] == sid) { already = true; break; }
         }
-        audio_chunk_header_t hdr = {0};
-        if (!read_audio_chunk_header_from_path(path, &hdr)) {
-            continue;
-        }
-        if (hdr.msg_type == AUDIO_MSG_TYPE && hdr.seq_num == 0U) {
-            recordings++;
+        if (!already && seen_count < (sizeof(seen) / sizeof(seen[0]))) {
+            seen[seen_count++] = sid;
         }
     }
 
     closedir(dir);
-    return recordings;
+    return seen_count;
 }
 
 static esp_err_t drop_oldest_audio_recording(void)
 {
+    /* Find the lexicographically smallest session_id present on disk and
+     * delete every chunk belonging to it. Also clear it from the pending
+     * session table if present. */
     DIR *dir = opendir(STORAGE_SCAN_PATH);
     if (dir == NULL) {
         return ESP_FAIL;
     }
 
-    uint32_t oldest_start_seq = UINT32_MAX;
-    uint16_t oldest_total_chunks = 0;
+    uint32_t oldest_sid = 0;
+    bool found = false;
     struct dirent *entry = NULL;
-    char path[STORAGE_PATH_MAX];
 
     while ((entry = readdir(dir)) != NULL) {
-        uint32_t seq = 0;
-        if (sscanf(entry->d_name, "audio_%" SCNu32 ".bin", &seq) != 1) {
+        uint32_t sid = 0;
+        if (!parse_audio_chunk_name(entry->d_name, &sid, NULL)) {
             continue;
         }
-
-        if (!build_storage_entry_path(path, sizeof(path), entry->d_name)) {
-            continue;
-        }
-        audio_chunk_header_t hdr = {0};
-        if (!read_audio_chunk_header_from_path(path, &hdr)) {
-            continue;
-        }
-        if (hdr.msg_type != AUDIO_MSG_TYPE || hdr.seq_num != 0U) {
-            continue;
-        }
-        if (seq < oldest_start_seq) {
-            oldest_start_seq = seq;
-            oldest_total_chunks = hdr.total_chunks;
+        if (!found || sid < oldest_sid) {
+            oldest_sid = sid;
+            found = true;
         }
     }
     closedir(dir);
 
-    if (oldest_start_seq == UINT32_MAX || oldest_total_chunks == 0U) {
+    if (!found) {
         return ESP_ERR_NOT_FOUND;
     }
 
+    delete_session_files(oldest_sid);
+    pending_session_remove(oldest_sid);
+    ESP_LOGI(TAG, "Dropped oldest audio recording sid=%08" PRIX32, oldest_sid);
+    return ESP_OK;
+}
+
+static bool s_session_id_armed = false;
+
+static esp_err_t init_session_id_generator(void)
+{
+    if (s_session_id_armed) {
+        return ESP_OK;
+    }
+
+    nvs_handle_t handle;
+    esp_err_t err = nvs_open(OFFLINE_NVS_NAMESPACE, NVS_READWRITE, &handle);
+    if (err != ESP_OK) {
+        ESP_LOGW(TAG, "session_id NVS open failed: %s", esp_err_to_name(err));
+        s_session_id_boot_ctr = (uint16_t)(xTaskGetTickCount() & 0xFFFFu);
+        s_session_id_next_low = 0;
+        s_session_id_armed = true;
+        return err;
+    }
+
+    uint16_t boot_ctr = 0;
+    err = nvs_get_u16(handle, SESSION_NVS_BOOT_CTR_KEY, &boot_ctr);
+    if (err == ESP_ERR_NVS_NOT_FOUND) {
+        boot_ctr = 0;
+        err = ESP_OK;
+    }
+    if (err != ESP_OK) {
+        nvs_close(handle);
+        ESP_LOGW(TAG, "session_id NVS read failed: %s", esp_err_to_name(err));
+        s_session_id_boot_ctr = (uint16_t)(xTaskGetTickCount() & 0xFFFFu);
+        s_session_id_next_low = 0;
+        s_session_id_armed = true;
+        return err;
+    }
+
+    boot_ctr = (uint16_t)(boot_ctr + 1U);
+    err = nvs_set_u16(handle, SESSION_NVS_BOOT_CTR_KEY, boot_ctr);
+    if (err == ESP_OK) {
+        err = nvs_commit(handle);
+    }
+    nvs_close(handle);
+
+    s_session_id_boot_ctr = boot_ctr;
+    s_session_id_next_low = 0;
+    s_session_id_armed = true;
+    ESP_LOGI(TAG, "Session id generator armed: boot_ctr=%u", (unsigned)boot_ctr);
+    return err;
+}
+
+static uint32_t next_session_id(void)
+{
+    if (!s_session_id_armed) {
+        init_session_id_generator();
+    }
+    uint32_t high = (uint32_t)s_session_id_boot_ctr;
+    uint16_t low = s_session_id_next_low++;
+    return (high << 16) | (uint32_t)low;
+}
+
+static bool pending_session_register(uint32_t session_id, uint16_t total_chunks)
+{
+    bool ok = false;
+    TickType_t now = xTaskGetTickCount();
+    portENTER_CRITICAL(&s_pending_sessions_mux);
+    for (size_t i = 0; i < AUDIO_SESSION_MAX_PENDING; i++) {
+        if (s_pending_sessions[i].in_use && s_pending_sessions[i].session_id == session_id) {
+            s_pending_sessions[i].total_chunks = total_chunks;
+            s_pending_sessions[i].last_activity_tick = now;
+            ok = true;
+            break;
+        }
+    }
+    if (!ok) {
+        for (size_t i = 0; i < AUDIO_SESSION_MAX_PENDING; i++) {
+            if (!s_pending_sessions[i].in_use) {
+                s_pending_sessions[i].in_use = true;
+                s_pending_sessions[i].session_id = session_id;
+                s_pending_sessions[i].total_chunks = total_chunks;
+                s_pending_sessions[i].started_tick = now;
+                s_pending_sessions[i].last_activity_tick = now;
+                ok = true;
+                break;
+            }
+        }
+    }
+    portEXIT_CRITICAL(&s_pending_sessions_mux);
+    if (!ok) {
+        ESP_LOGW(TAG, "pending_session_register: table full, sid=%08" PRIX32, session_id);
+    }
+    return ok;
+}
+
+static bool pending_session_touch(uint32_t session_id)
+{
+    bool ok = false;
+    TickType_t now = xTaskGetTickCount();
+    portENTER_CRITICAL(&s_pending_sessions_mux);
+    for (size_t i = 0; i < AUDIO_SESSION_MAX_PENDING; i++) {
+        if (s_pending_sessions[i].in_use && s_pending_sessions[i].session_id == session_id) {
+            s_pending_sessions[i].last_activity_tick = now;
+            ok = true;
+            break;
+        }
+    }
+    portEXIT_CRITICAL(&s_pending_sessions_mux);
+    return ok;
+}
+
+static bool pending_session_remove(uint32_t session_id)
+{
+    bool removed = false;
+    portENTER_CRITICAL(&s_pending_sessions_mux);
+    for (size_t i = 0; i < AUDIO_SESSION_MAX_PENDING; i++) {
+        if (s_pending_sessions[i].in_use && s_pending_sessions[i].session_id == session_id) {
+            s_pending_sessions[i] = (pending_audio_session_t){0};
+            removed = true;
+            break;
+        }
+    }
+    portEXIT_CRITICAL(&s_pending_sessions_mux);
+    return removed;
+}
+
+static size_t pending_session_count(void)
+{
+    size_t count = 0;
+    portENTER_CRITICAL(&s_pending_sessions_mux);
+    for (size_t i = 0; i < AUDIO_SESSION_MAX_PENDING; i++) {
+        if (s_pending_sessions[i].in_use) count++;
+    }
+    portEXIT_CRITICAL(&s_pending_sessions_mux);
+    return count;
+}
+
+static void delete_session_files(uint32_t session_id)
+{
+    /* Heap-allocate the filename list so we don't blow the task stack. SPIFFS
+     * readdir+unlink mid-iteration is undefined, so we collect first, then
+     * close the dir, then unlink. */
+    #define DELETE_NAMES_MAX 64
+    #define DELETE_NAME_LEN  32
+    char (*names)[DELETE_NAME_LEN] = calloc(DELETE_NAMES_MAX, DELETE_NAME_LEN);
+    if (names == NULL) {
+        ESP_LOGW(TAG, "delete_session_files: out of heap, skipping sid=%08" PRIX32, session_id);
+        return;
+    }
+
+    DIR *dir = opendir(STORAGE_SCAN_PATH);
+    if (dir == NULL) {
+        free(names);
+        return;
+    }
+
+    size_t n_names = 0;
+    struct dirent *entry = NULL;
+    while ((entry = readdir(dir)) != NULL && n_names < DELETE_NAMES_MAX) {
+        uint32_t sid = 0;
+        if (!parse_audio_chunk_name(entry->d_name, &sid, NULL)) continue;
+        if (sid != session_id) continue;
+        strncpy(names[n_names], entry->d_name, DELETE_NAME_LEN - 1U);
+        names[n_names][DELETE_NAME_LEN - 1U] = '\0';
+        n_names++;
+    }
+    closedir(dir);
+
     size_t deleted = 0;
-    for (uint16_t i = 0; i < oldest_total_chunks; i++) {
-        snprintf(path, sizeof(path), STORAGE_BASE_PATH "/audio_%" PRIu32 ".bin",
-                 oldest_start_seq + (uint32_t)i);
+    char path[STORAGE_PATH_MAX];
+    for (size_t i = 0; i < n_names; i++) {
+        if (!build_storage_entry_path(path, sizeof(path), names[i])) continue;
         if (unlink(path) == 0) {
             deleted++;
         } else if (errno != ENOENT) {
-            ESP_LOGW(TAG, "Failed to drop %s: errno=%d", path, errno);
+            ESP_LOGW(TAG, "Failed to unlink %s: errno=%d", path, errno);
+        }
+    }
+    free(names);
+    ESP_LOGI(TAG, "Cleared %u file(s) for session sid=%08" PRIX32, (unsigned)deleted, session_id);
+    #undef DELETE_NAMES_MAX
+    #undef DELETE_NAME_LEN
+}
+
+static void retransmit_session_chunk(uint32_t session_id, uint16_t seq_num)
+{
+    char path[STORAGE_PATH_MAX];
+    audio_chunk_path(path, sizeof(path), session_id, seq_num);
+
+    FILE *file = fopen(path, "rb");
+    if (file == NULL) {
+        ESP_LOGW(TAG, "Retransmit: missing %s", path);
+        return;
+    }
+
+    /* Heap-allocate the 1470-byte read buffer so we stay friendly to small
+     * task stacks (e.g. the ESP-NOW recv callback that invokes the NACK
+     * handler). */
+    uint8_t *buffer = malloc(STORAGE_READ_BUFFER_MAX);
+    if (buffer == NULL) {
+        ESP_LOGW(TAG, "Retransmit: out of heap for sid=%08" PRIX32 " seq=%u",
+                 session_id, (unsigned)seq_num);
+        fclose(file);
+        return;
+    }
+
+    size_t read_len = fread(buffer, 1, STORAGE_READ_BUFFER_MAX, file);
+    fclose(file);
+    if (read_len < AUDIO_CHUNK_HDR_SIZE) {
+        ESP_LOGW(TAG, "Retransmit: truncated chunk %s (%u bytes)", path, (unsigned)read_len);
+        free(buffer);
+        return;
+    }
+
+    bool delivered = false;
+    esp_err_t err = espnow_manager_send_and_wait(buffer, read_len, AUDIO_SEND_TIMEOUT_MS, &delivered);
+    if (err != ESP_OK) {
+        ESP_LOGW(TAG, "Retransmit send failed sid=%08" PRIX32 " seq=%u: %s",
+                 session_id, (unsigned)seq_num, esp_err_to_name(err));
+    } else if (!delivered) {
+        ESP_LOGW(TAG, "Retransmit no MAC-ACK sid=%08" PRIX32 " seq=%u",
+                 session_id, (unsigned)seq_num);
+    }
+    free(buffer);
+}
+
+static void retransmit_session_all(uint32_t session_id)
+{
+    #define RETRANSMIT_MAX_SEQS 256
+    uint16_t *seqs = malloc(sizeof(uint16_t) * RETRANSMIT_MAX_SEQS);
+    if (seqs == NULL) {
+        ESP_LOGW(TAG, "Self-retransmit out of heap for sid=%08" PRIX32, session_id);
+        return;
+    }
+
+    DIR *dir = opendir(STORAGE_SCAN_PATH);
+    if (dir == NULL) {
+        free(seqs);
+        return;
+    }
+
+    size_t n_seqs = 0;
+    struct dirent *entry = NULL;
+    while ((entry = readdir(dir)) != NULL && n_seqs < RETRANSMIT_MAX_SEQS) {
+        uint32_t sid = 0;
+        uint16_t seq = 0;
+        if (!parse_audio_chunk_name(entry->d_name, &sid, &seq)) continue;
+        if (sid != session_id) continue;
+        seqs[n_seqs++] = seq;
+    }
+    closedir(dir);
+
+    ESP_LOGI(TAG, "Self-retransmit sid=%08" PRIX32 ": %u chunk(s)",
+             session_id, (unsigned)n_seqs);
+    for (size_t i = 0; i < n_seqs; i++) {
+        retransmit_session_chunk(session_id, seqs[i]);
+        vTaskDelay(pdMS_TO_TICKS(AUDIO_INTER_CHUNK_DELAY_MS));
+    }
+    free(seqs);
+    #undef RETRANSMIT_MAX_SEQS
+}
+
+static void handle_audio_nack(const uint8_t *data, int len)
+{
+    if (len < (int)sizeof(audio_nack_msg_t)) {
+        ESP_LOGW(TAG, "NACK packet too short (%d bytes)", len);
+        return;
+    }
+    const audio_nack_msg_t *hdr = (const audio_nack_msg_t *)data;
+
+    uint8_t own_mac[6];
+    esp_read_mac(own_mac, ESP_MAC_WIFI_STA);
+    if (memcmp(hdr->target_mac, own_mac, 6) != 0) {
+        return;  /* not for us */
+    }
+
+    size_t expected = sizeof(audio_nack_msg_t) + (size_t)hdr->missing_count * sizeof(uint16_t);
+    if ((size_t)len < expected) {
+        ESP_LOGW(TAG, "NACK truncated: header says %u seqs, only %d bytes",
+                 (unsigned)hdr->missing_count, len);
+        return;
+    }
+
+    /* The seqs array sits at an odd byte offset (13). Use memcpy to read each
+     * value to avoid unaligned uint16_t loads. */
+    const uint8_t *seqs_bytes = data + sizeof(audio_nack_msg_t);
+    uint32_t session_id = hdr->session_id;
+    uint16_t missing_count = hdr->missing_count;
+    ESP_LOGI(TAG, "NACK received sid=%08" PRIX32 ", %u missing seqs",
+             session_id, (unsigned)missing_count);
+
+    pending_session_touch(session_id);
+    for (uint16_t i = 0; i < missing_count; i++) {
+        uint16_t seq = 0;
+        memcpy(&seq, seqs_bytes + (size_t)i * sizeof(uint16_t), sizeof(seq));
+        retransmit_session_chunk(session_id, seq);
+        vTaskDelay(pdMS_TO_TICKS(AUDIO_INTER_CHUNK_DELAY_MS));
+    }
+}
+
+static void handle_audio_ack(const uint8_t *data, int len)
+{
+    if (len < (int)sizeof(audio_ack_msg_t)) {
+        ESP_LOGW(TAG, "ACK packet too short (%d bytes)", len);
+        return;
+    }
+    const audio_ack_msg_t *hdr = (const audio_ack_msg_t *)data;
+
+    uint8_t own_mac[6];
+    esp_read_mac(own_mac, ESP_MAC_WIFI_STA);
+    if (memcmp(hdr->target_mac, own_mac, 6) != 0) {
+        return;
+    }
+
+    ESP_LOGI(TAG, "SESSION_ACK sid=%08" PRIX32, hdr->session_id);
+    delete_session_files(hdr->session_id);
+    pending_session_remove(hdr->session_id);
+
+    if (pending_session_count() == 0U) {
+        audio_active = false;
+        s_sensor_resume_tick = xTaskGetTickCount() + pdMS_TO_TICKS(SEND_INTERVAL_MS);
+        ESP_LOGI(TAG, "All sessions cleared, sensors resume in %u ms",
+                 (unsigned)SEND_INTERVAL_MS);
+    }
+}
+
+static void audio_session_monitor_task(void *pvParameters)
+{
+    (void)pvParameters;
+
+    /* Deferred boot-time recovery: scan SPIFFS for orphan session files and
+     * register them. Runs once, after the system is stable and on this task's
+     * roomy stack. */
+    audio_recovery_scan_on_boot();
+
+    while (1) {
+        vTaskDelay(pdMS_TO_TICKS(1000));
+
+        TickType_t now = xTaskGetTickCount();
+        bool any_in_use = false;
+
+        for (size_t i = 0; i < AUDIO_SESSION_MAX_PENDING; i++) {
+            uint32_t session_id = 0;
+            TickType_t started = 0;
+            TickType_t last_act = 0;
+            bool in_use = false;
+
+            portENTER_CRITICAL(&s_pending_sessions_mux);
+            in_use = s_pending_sessions[i].in_use;
+            if (in_use) {
+                session_id = s_pending_sessions[i].session_id;
+                started = s_pending_sessions[i].started_tick;
+                last_act = s_pending_sessions[i].last_activity_tick;
+            }
+            portEXIT_CRITICAL(&s_pending_sessions_mux);
+
+            if (!in_use) continue;
+            any_in_use = true;
+
+            TickType_t elapsed_since_start = now - started;
+            TickType_t elapsed_since_act = now - last_act;
+
+            if (elapsed_since_start >= pdMS_TO_TICKS(AUDIO_SESSION_DEADLINE_MS)) {
+                ESP_LOGW(TAG, "Session sid=%08" PRIX32 " expired (%u ms), dropping",
+                         session_id, (unsigned)AUDIO_SESSION_DEADLINE_MS);
+                delete_session_files(session_id);
+                pending_session_remove(session_id);
+                continue;
+            }
+
+            if (elapsed_since_act >= pdMS_TO_TICKS(AUDIO_SESSION_QUIET_MS)) {
+                ESP_LOGI(TAG, "Session sid=%08" PRIX32 " quiet for %u ms, self-retransmitting",
+                         session_id, (unsigned)(elapsed_since_act * portTICK_PERIOD_MS));
+                pending_session_touch(session_id);
+                retransmit_session_all(session_id);
+            }
+        }
+
+        if (!any_in_use && audio_active) {
+            audio_active = false;
+            s_sensor_resume_tick = xTaskGetTickCount() + pdMS_TO_TICKS(SEND_INTERVAL_MS);
+            ESP_LOGI(TAG, "Pending session table empty, sensors resume in %u ms",
+                     (unsigned)SEND_INTERVAL_MS);
+        }
+    }
+}
+
+static void audio_recovery_scan_on_boot(void)
+{
+    DIR *dir = opendir(STORAGE_SCAN_PATH);
+    if (dir == NULL) {
+        return;
+    }
+
+    /* Discover all distinct session_ids and tally chunks per session. */
+    struct {
+        uint32_t sid;
+        uint16_t chunks;
+    } sessions[AUDIO_SESSION_MAX_PENDING * 4];
+    size_t n_sessions = 0;
+
+    struct dirent *entry = NULL;
+    while ((entry = readdir(dir)) != NULL) {
+        uint32_t sid = 0;
+        if (!parse_audio_chunk_name(entry->d_name, &sid, NULL)) continue;
+
+        bool found = false;
+        for (size_t i = 0; i < n_sessions; i++) {
+            if (sessions[i].sid == sid) {
+                sessions[i].chunks++;
+                found = true;
+                break;
+            }
+        }
+        if (!found && n_sessions < (sizeof(sessions) / sizeof(sessions[0]))) {
+            sessions[n_sessions].sid = sid;
+            sessions[n_sessions].chunks = 1;
+            n_sessions++;
+        }
+    }
+    closedir(dir);
+
+    if (n_sessions == 0U) {
+        return;
+    }
+
+    /* Only the first AUDIO_SESSION_MAX_PENDING fit in the tracker. Drop any
+     * surplus from disk so we don't accumulate dead files forever. */
+    for (size_t i = 0; i < n_sessions; i++) {
+        if (i < AUDIO_SESSION_MAX_PENDING) {
+            pending_session_register(sessions[i].sid, sessions[i].chunks);
+            ESP_LOGI(TAG, "Recovered pending audio session sid=%08" PRIX32 ", %u chunk(s)",
+                     sessions[i].sid, (unsigned)sessions[i].chunks);
+        } else {
+            ESP_LOGW(TAG, "Boot recovery overflow: dropping session sid=%08" PRIX32,
+                     sessions[i].sid);
+            delete_session_files(sessions[i].sid);
         }
     }
 
-    ESP_LOGI(TAG, "Dropped oldest audio recording: start_seq=%" PRIu32
-                  ", expected_chunks=%u, removed=%u",
-             oldest_start_seq, (unsigned)oldest_total_chunks, (unsigned)deleted);
-    return ESP_OK;
+    if (pending_session_count() > 0U) {
+        audio_active = true;
+    }
 }
 
 static void initialize_sensors(void)
@@ -952,9 +1477,10 @@ static void send_audio_chunks(const uint8_t *adpcm_data, size_t adpcm_len, uint3
     esp_read_mac(wifi_mac, ESP_MAC_WIFI_STA);
 
     uint16_t total_chunks = (uint16_t)((adpcm_len + AUDIO_CHUNK_DATA_MAX - 1) / AUDIO_CHUNK_DATA_MAX);
+    uint32_t session_id = next_session_id();
 
-    ESP_LOGI(TAG, "Sending audio: %zu bytes ADPCM, %"PRIu32" samples, %u chunks",
-             adpcm_len, total_samples, total_chunks);
+    ESP_LOGI(TAG, "Sending audio: sid=%08" PRIX32 ", %zu bytes ADPCM, %"PRIu32" samples, %u chunks",
+             session_id, adpcm_len, total_samples, total_chunks);
 
     while (count_queued_audio_recordings() >= OFFLINE_MAX_AUDIO_RECORDINGS) {
         ESP_LOGW(TAG, "Audio queue at cap (%u recordings); dropping oldest",
@@ -964,12 +1490,22 @@ static void send_audio_chunks(const uint8_t *adpcm_data, size_t adpcm_len, uint3
         }
     }
 
+    /* Register the session up-front so monitor task tracks it from the start
+     * and sensor activity stays suspended even if MAC-level sends fail.
+     * Re-assert audio_active in case an unrelated SESSION_ACK cleared it
+     * between the button press and this call. */
+    audio_active = true;
+    pending_session_register(session_id, total_chunks);
+
+    size_t persisted = 0;
+    size_t sent_ok = 0;
     for (uint16_t i = 0; i < total_chunks; i++) {
         uint8_t pkt[ESPNOW_MAX_PAYLOAD];
         audio_chunk_header_t *hdr = (audio_chunk_header_t *)pkt;
 
         hdr->msg_type      = AUDIO_MSG_TYPE;
         memcpy(hdr->node_mac, wifi_mac, 6);
+        hdr->session_id    = session_id;
         hdr->seq_num       = i;
         hdr->total_chunks  = total_chunks;
         hdr->sample_rate   = AUDIO_SAMPLE_RATE;
@@ -988,18 +1524,30 @@ static void send_audio_chunks(const uint8_t *adpcm_data, size_t adpcm_len, uint3
             ESP_LOGE(TAG, "Failed to persist audio chunk %u/%u", i + 1, total_chunks);
             continue;
         }
+        persisted++;
 
-        vTaskDelay(pdMS_TO_TICKS(5));
+        if (!s_offline_mode) {
+            esp_err_t send_err = espnow_manager_send(pkt, pkt_len);
+            if (send_err == ESP_OK) {
+                sent_ok++;
+            } else {
+                ESP_LOGW(TAG, "Initial send failed sid=%08" PRIX32 " seq=%u: %s",
+                         session_id, (unsigned)i, esp_err_to_name(send_err));
+            }
+        }
+
+        vTaskDelay(pdMS_TO_TICKS(AUDIO_INTER_CHUNK_DELAY_MS));
     }
 
+    /* Touch the session at end-of-burst so the quiet timer resets. */
+    pending_session_touch(session_id);
+
     if (s_offline_mode) {
-        ESP_LOGI(TAG, "Audio recording stored offline (%u audio pending)",
-                 (unsigned)count_queued_packets(QUEUE_KIND_AUDIO));
-    } else if (!flush_persistent_queues(NULL)) {
-        ESP_LOGW(TAG, "Audio queued for later delivery (%u audio pending)",
-                 (unsigned)count_queued_packets(QUEUE_KIND_AUDIO));
+        ESP_LOGI(TAG, "Audio session sid=%08" PRIX32 " persisted offline (%u/%u chunks on disk)",
+                 session_id, (unsigned)persisted, (unsigned)total_chunks);
     } else {
-        ESP_LOGI(TAG, "Audio transmission complete");
+        ESP_LOGI(TAG, "Audio session sid=%08" PRIX32 " transmitted: persisted=%u/%u, send_ok=%u, awaiting ACK",
+                 session_id, (unsigned)persisted, (unsigned)total_chunks, (unsigned)sent_ok);
     }
 }
 
@@ -1090,11 +1638,12 @@ static void button_task(void *pvParameters)
                         ESP_LOGI(TAG, "Diagnostic audio capture stopped: %zu samples (%.1f sec, %zu bytes ADPCM)",
                                  total_samples, (float)total_samples / AUDIO_SAMPLE_RATE, adpcm_offset);
 
+                        bool session_started = false;
                         if (total_samples > 0) {
                             send_audio_chunks(adpcm_buf, adpcm_offset, (uint32_t)total_samples);
+                            session_started = (pending_session_count() > 0U);
                         }
 
-                        audio_active = false;
                         was_pressed = false;
                         if (led_manager_set(false) != ESP_OK) {
                             ESP_LOGW(TAG, "Failed to clear LED after diagnostic mic capture");
@@ -1102,7 +1651,13 @@ static void button_task(void *pvParameters)
                         while (button_pressed()) {
                             vTaskDelay(pdMS_TO_TICKS(10));
                         }
-                        s_sensor_resume_tick = xTaskGetTickCount() + pdMS_TO_TICKS(SEND_INTERVAL_MS);
+                        /* If a session was registered, audio_active stays true
+                         * until SESSION_ACK or the 30 s deadline — the monitor
+                         * task arms s_sensor_resume_tick at that point. */
+                        if (!session_started) {
+                            audio_active = false;
+                            s_sensor_resume_tick = xTaskGetTickCount() + pdMS_TO_TICKS(SEND_INTERVAL_MS);
+                        }
                         free(adpcm_buf);
                     }
                 } else if (!pressed) {
@@ -1293,6 +1848,10 @@ void app_main(void)
         }
         ESP_ERROR_CHECK(ret);
         ESP_ERROR_CHECK(init_persistent_queue());
+        /* Session ID generator now self-initializes lazily on first
+         * next_session_id() call so a flaky NVS write can't brick the boot. */
+        /* Boot-time orphan-session recovery deferred to the monitor task —
+         * see audio_session_monitor_task. Keeps app_main's stack lean. */
 
         ESP_ERROR_CHECK(i2c_manager_init(&i2c_config, &i2c_bus));
         i2c_manager_scan(i2c_bus, i2c_config.scl_speed_hz, TAG);
@@ -1342,6 +1901,7 @@ void app_main(void)
 
         ESP_LOGI(TAG, "Diagnostic mode: button + LED + full audio path + rewritten sensor send path");
         xTaskCreate(send_task, "send_task", 4096, NULL, 4, NULL);
+        xTaskCreate(audio_session_monitor_task, "audio_session_mon", 8192, NULL, 4, NULL);
     } else {
         const web_monitor_manager_config_t web_monitor_config = {
             .ap_ssid = WEB_MONITOR_AP_SSID,
@@ -1396,6 +1956,10 @@ void app_main(void)
         }
         ESP_ERROR_CHECK(ret);
         ESP_ERROR_CHECK(init_persistent_queue());
+        /* Session ID generator now self-initializes lazily on first
+         * next_session_id() call so a flaky NVS write can't brick the boot. */
+        /* Boot-time orphan-session recovery deferred to the monitor task —
+         * see audio_session_monitor_task. Keeps app_main's stack lean. */
 
         ESP_ERROR_CHECK(espnow_manager_init(&espnow_config));
         memcpy(base_station_mac, espnow_config.peer_mac, sizeof(base_station_mac));
@@ -1439,6 +2003,7 @@ void app_main(void)
                  (unsigned)count_queued_packets(QUEUE_KIND_SENSOR));
 
         xTaskCreate(send_task, "send_task", 4096, NULL, 4, NULL);
+        xTaskCreate(audio_session_monitor_task, "audio_session_mon", 8192, NULL, 4, NULL);
     }
 
     xTaskCreate(button_task, "button_task", 8192, NULL, 5, NULL);

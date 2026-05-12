@@ -47,12 +47,24 @@ DEFAULT_SCHEMA_PATH = (
 SCHEMA_PATH = Path(os.getenv("SCHEMA_PATH", str(DEFAULT_SCHEMA_PATH)))
 
 
-# 19-byte packed header:
-# msg_type (0x02), node_mac[6], seq_num(uint16 LE), total_chunks(uint16 LE),
-# sample_rate(uint16 LE), total_samples(uint32 LE), data_len(uint16 LE)
-HEADER_FMT = "<B6sHHHIH"
+# 23-byte packed header:
+# msg_type (0x02), node_mac[6], session_id(uint32 LE), seq_num(uint16 LE),
+# total_chunks(uint16 LE), sample_rate(uint16 LE), total_samples(uint32 LE),
+# data_len(uint16 LE)
+HEADER_FMT = "<B6sIHHHIH"
 HEADER_SIZE = struct.calcsize(HEADER_FMT)
 AUDIO_MSG_TYPE = 0x02
+AUDIO_NACK_MSG_TYPE = 0x04
+AUDIO_ACK_MSG_TYPE = 0x05
+
+# Pi -> wearable command frame: [0xAA 0x55 len_lo len_hi payload crc8]
+FRAME_SYNC1 = 0xAA
+FRAME_SYNC2 = 0x55
+
+# A session is considered stalled (and worth NACK'ing) after this much silence.
+NACK_QUIET_SECONDS = 2.0
+# Cap NACK payload so we stay under the ESP-NOW v2 1470-byte limit.
+NACK_MAX_SEQS_PER_FRAME = 200
 
 DESKTOP_DIR = Path.home() / "Desktop"
 OUTPUT_DIR = DESKTOP_DIR if DESKTOP_DIR.exists() else Path.home()
@@ -525,22 +537,61 @@ class AudioSession:
     total_chunks: int
     sample_rate: int
     total_samples: int
-    session_id: str
+    session_id: str  # human-readable label (mac+timestamp)
+    wire_session_id: int  # 32-bit session_id from the chunk header
     session_dir: Path
     chunks: dict = field(default_factory=dict)
     started_at: float = field(default_factory=time.time)
+    last_chunk_at: float = field(default_factory=time.time)
+    nack_rounds: int = 0
     raw_stream_path: Path = None
     adpcm_concat_path: Path = None
     info_path: Path = None
 
     def add_chunk(self, seq_num: int, data: bytes):
         self.chunks[seq_num] = data
+        self.last_chunk_at = time.time()
 
     def is_complete(self) -> bool:
         return self.total_chunks > 0 and len(self.chunks) == self.total_chunks
 
     def missing_chunks(self):
         return [i for i in range(self.total_chunks) if i not in self.chunks]
+
+
+def _crc8_07(data: bytes) -> int:
+    crc = 0x00
+    for byte in data:
+        crc ^= byte
+        for _ in range(8):
+            crc = ((crc << 1) ^ 0x07) & 0xFF if (crc & 0x80) else (crc << 1) & 0xFF
+    return crc
+
+
+def build_command_frame(payload: bytes) -> bytes:
+    """Wrap a wearable-bound command in [0xAA 0x55 len_lo len_hi payload crc8]."""
+    if len(payload) == 0 or len(payload) > 0xFFFF:
+        raise ValueError(f"command payload length out of range: {len(payload)}")
+    length = len(payload)
+    header = bytes([length & 0xFF, (length >> 8) & 0xFF])
+    crc = _crc8_07(header + payload)
+    return bytes([FRAME_SYNC1, FRAME_SYNC2]) + header + payload + bytes([crc])
+
+
+def build_audio_nack_payload(target_mac: bytes, wire_session_id: int, missing_seqs):
+    if len(target_mac) != 6:
+        raise ValueError("target_mac must be 6 bytes")
+    seqs = list(missing_seqs)[:NACK_MAX_SEQS_PER_FRAME]
+    header = struct.pack("<B6sIH", AUDIO_NACK_MSG_TYPE, target_mac,
+                         wire_session_id & 0xFFFFFFFF, len(seqs))
+    return header + struct.pack("<" + "H" * len(seqs), *seqs)
+
+
+def build_audio_ack_payload(target_mac: bytes, wire_session_id: int) -> bytes:
+    if len(target_mac) != 6:
+        raise ValueError("target_mac must be 6 bytes")
+    return struct.pack("<B6sI", AUDIO_ACK_MSG_TYPE, target_mac,
+                       wire_session_id & 0xFFFFFFFF)
 
 
 def mac_to_str(mac: bytes) -> str:
@@ -671,10 +722,11 @@ def write_wav_file(node_mac: bytes, sample_rate: int, total_samples: int, pcm_da
     return out_path
 
 
-def create_session(node_mac: bytes, total_chunks: int, sample_rate: int, total_samples: int) -> AudioSession:
+def create_session(node_mac: bytes, wire_session_id: int, total_chunks: int,
+                    sample_rate: int, total_samples: int) -> AudioSession:
     timestamp = time.strftime("%Y%m%d_%H%M%S")
     mac_compact = mac_to_str(node_mac).replace(":", "")
-    session_id = f"{mac_compact}_{timestamp}"
+    session_id = f"{mac_compact}_{wire_session_id:08X}_{timestamp}"
     session_dir = DEBUG_DIR / f"audio_debug_{session_id}"
     session_dir.mkdir(parents=True, exist_ok=True)
 
@@ -684,6 +736,7 @@ def create_session(node_mac: bytes, total_chunks: int, sample_rate: int, total_s
         sample_rate=sample_rate,
         total_samples=total_samples,
         session_id=session_id,
+        wire_session_id=wire_session_id,
         session_dir=session_dir,
     )
     session.raw_stream_path = session_dir / "raw_packets_stream.bin"
@@ -692,6 +745,7 @@ def create_session(node_mac: bytes, total_chunks: int, sample_rate: int, total_s
 
     with open(session.info_path, "w", encoding="utf-8") as f:
         f.write(f"session_id={session_id}\n")
+        f.write(f"wire_session_id={wire_session_id:08X}\n")
         f.write(f"node_mac={mac_to_str(node_mac)}\n")
         f.write(f"total_chunks={total_chunks}\n")
         f.write(f"sample_rate={sample_rate}\n")
@@ -702,10 +756,39 @@ def create_session(node_mac: bytes, total_chunks: int, sample_rate: int, total_s
 
 
 class UARTAudioMonitor:
-    def __init__(self, firebase: "FirebaseClient"):
+    def __init__(self, firebase: "FirebaseClient", serial_port=None):
         self.buffer = bytearray()
-        self.sessions = {}
+        self.sessions = {}  # keyed by (mac_str, wire_session_id)
         self.firebase = firebase
+        self.serial_port = serial_port
+
+    def _send_command_frame(self, payload: bytes, log_label: str):
+        if self.serial_port is None:
+            print(f"[CMD] no serial port; cannot send {log_label}")
+            return
+        try:
+            frame = build_command_frame(payload)
+            self.serial_port.write(frame)
+            print(f"[CMD] sent {log_label} ({len(frame)} bytes incl. framing)")
+        except Exception as e:
+            print(f"[CMD] failed to send {log_label}: {e}")
+
+    def send_nack(self, node_mac: bytes, wire_session_id: int, missing_seqs):
+        seqs = list(missing_seqs)
+        for offset in range(0, len(seqs), NACK_MAX_SEQS_PER_FRAME):
+            chunk_seqs = seqs[offset:offset + NACK_MAX_SEQS_PER_FRAME]
+            payload = build_audio_nack_payload(node_mac, wire_session_id, chunk_seqs)
+            label = (
+                f"NACK mac={mac_to_str(node_mac)} sid={wire_session_id:08X} "
+                f"seqs={chunk_seqs[:8]}{'...' if len(chunk_seqs) > 8 else ''} (n={len(chunk_seqs)})"
+            )
+            self._send_command_frame(payload, label)
+
+    def send_ack(self, node_mac: bytes, wire_session_id: int):
+        payload = build_audio_ack_payload(node_mac, wire_session_id)
+        self._send_command_frame(
+            payload, f"ACK mac={mac_to_str(node_mac)} sid={wire_session_id:08X}"
+        )
 
     def handle_text_line(self, text: str):
         """Pretty-print a UART text line. If it's a JSON sensor payload, also submit it."""
@@ -777,26 +860,19 @@ class UARTAudioMonitor:
         header = packet[:HEADER_SIZE]
         payload = packet[HEADER_SIZE:]
 
-        msg_type, node_mac, seq_num, total_chunks, sample_rate, total_samples, data_len = struct.unpack(
-            HEADER_FMT, header
-        )
+        (msg_type, node_mac, wire_session_id, seq_num, total_chunks,
+         sample_rate, total_samples, data_len) = struct.unpack(HEADER_FMT, header)
 
         if msg_type != AUDIO_MSG_TYPE:
             return
 
         mac_key = mac_to_str(node_mac)
+        key = (mac_key, wire_session_id)
 
-        session = self.sessions.get(mac_key)
+        session = self.sessions.get(key)
         if session is None:
-            session = create_session(node_mac, total_chunks, sample_rate, total_samples)
-            self.sessions[mac_key] = session
-            print(f"[AUDIO] Debug dump directory: {session.session_dir}")
-
-        if seq_num == 0 and session.chunks:
-            if not session.is_complete():
-                print(f"[AUDIO] Restart detected from {mac_key}, discarding incomplete previous transfer")
-            session = create_session(node_mac, total_chunks, sample_rate, total_samples)
-            self.sessions[mac_key] = session
+            session = create_session(node_mac, wire_session_id, total_chunks, sample_rate, total_samples)
+            self.sessions[key] = session
             print(f"[AUDIO] Debug dump directory: {session.session_dir}")
 
         if (
@@ -804,31 +880,34 @@ class UARTAudioMonitor:
             or session.sample_rate != sample_rate
             or session.total_samples != total_samples
         ):
-            print(f"[AUDIO] Metadata changed mid-transfer for {mac_key}, resetting session")
-            session = create_session(node_mac, total_chunks, sample_rate, total_samples)
-            self.sessions[mac_key] = session
+            print(f"[AUDIO] Metadata changed mid-transfer for {mac_key} sid={wire_session_id:08X}, resetting session")
+            session = create_session(node_mac, wire_session_id, total_chunks, sample_rate, total_samples)
+            self.sessions[key] = session
             print(f"[AUDIO] Debug dump directory: {session.session_dir}")
 
         if len(payload) != data_len:
-            print(f"[AUDIO] Warning: payload length mismatch from {mac_key}: header={data_len}, actual={len(payload)}")
+            print(f"[AUDIO] Warning: payload length mismatch from {mac_key} sid={wire_session_id:08X}: header={data_len}, actual={len(payload)}")
 
         self.log_raw_packet(session, seq_num, packet, payload)
         session.add_chunk(seq_num, payload)
 
         print(
-            f"[AUDIO] {mac_key} chunk {seq_num + 1}/{total_chunks} "
+            f"[AUDIO] {mac_key} sid={wire_session_id:08X} chunk {seq_num + 1}/{total_chunks} "
             f"({len(payload)} bytes ADPCM, sample_rate={sample_rate}, total_samples={total_samples})"
         )
         print(f"[AUDIO] Header hex:  {bytes_to_hex_preview(header, HEADER_SIZE)}")
         print(f"[AUDIO] Payload hex: {bytes_to_hex_preview(payload, 64)}")
 
         if session.is_complete():
-            self.finalize_session(mac_key)
+            # Acknowledge before finalize so wearable can drop SPIFFS state ASAP.
+            self.send_ack(session.node_mac, session.wire_session_id)
+            self.finalize_session(key)
 
-    def finalize_session(self, mac_key: str):
-        session = self.sessions.get(mac_key)
+    def finalize_session(self, key):
+        session = self.sessions.get(key)
         if session is None:
             return
+        mac_key = key[0] if isinstance(key, tuple) else key
 
         ordered_adpcm = bytearray()
         missing = session.missing_chunks()
@@ -942,23 +1021,44 @@ class UARTAudioMonitor:
         except Exception as e:
             print(f"[AUDIO] Failed to decode/save audio from {mac_key}: {e}")
 
-        del self.sessions[mac_key]
+        del self.sessions[key]
 
     def cleanup_stale_sessions(self, timeout_seconds: float = 30.0):
         now = time.time()
         stale = []
-        for mac_key, session in self.sessions.items():
+        for key, session in self.sessions.items():
             if now - session.started_at > timeout_seconds:
-                stale.append(mac_key)
+                stale.append(key)
 
-        for mac_key in stale:
-            session = self.sessions[mac_key]
+        for key in stale:
+            session = self.sessions[key]
             print(
-                f"[AUDIO] Discarding stale incomplete session from {mac_key}, "
+                f"[AUDIO] Discarding stale incomplete session from {key[0]} sid={key[1]:08X}, "
                 f"missing chunks: {session.missing_chunks()}"
             )
             print(f"[AUDIO] Partial debug files kept in: {session.session_dir}")
-            del self.sessions[mac_key]
+            del self.sessions[key]
+
+    def request_missing_chunks(self):
+        """Send a NACK for any session that's been quiet for NACK_QUIET_SECONDS
+        but is still incomplete. The wearable's 30 s deadline is the
+        authoritative cap, so we don't impose our own round limit."""
+        now = time.time()
+        for key, session in self.sessions.items():
+            if session.is_complete():
+                continue
+            if now - session.last_chunk_at < NACK_QUIET_SECONDS:
+                continue
+            missing = session.missing_chunks()
+            if not missing:
+                continue
+            session.nack_rounds += 1
+            session.last_chunk_at = now  # reset the quiet timer so the next NACK waits again
+            print(
+                f"[AUDIO] NACK round {session.nack_rounds} for {key[0]} sid={key[1]:08X}, "
+                f"missing={len(missing)} of {session.total_chunks}"
+            )
+            self.send_nack(session.node_mac, session.wire_session_id, missing)
 
     def process_buffer(self):
         while self.buffer:
@@ -967,7 +1067,8 @@ class UARTAudioMonitor:
                     return
 
                 try:
-                    msg_type, node_mac, seq_num, total_chunks, sample_rate, total_samples, data_len = struct.unpack(
+                    (_msg_type, _node_mac, _wire_sid, _seq_num, _total_chunks,
+                     _sample_rate, _total_samples, data_len) = struct.unpack(
                         HEADER_FMT, self.buffer[:HEADER_SIZE]
                     )
                 except struct.error:
@@ -1037,7 +1138,7 @@ def main():
     print(f"Raw packet dumps will be saved to: {DEBUG_DIR}")
     print(f"Firebase offline queue will be saved to: {FIREBASE_FALLBACK_DIR}")
 
-    monitor = UARTAudioMonitor(firebase_client)
+    monitor = UARTAudioMonitor(firebase_client, serial_port=ser)
 
     print("[WEATHER] fetching initial Auckland (Airport) pressure...")
     update_weather_reference(firebase_client)
@@ -1050,6 +1151,7 @@ def main():
                 monitor.buffer.extend(chunk)
                 monitor.process_buffer()
 
+            monitor.request_missing_chunks()
             monitor.cleanup_stale_sessions()
 
             if time.time() >= next_weather_fetch:
