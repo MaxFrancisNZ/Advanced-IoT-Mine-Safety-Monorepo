@@ -1,5 +1,16 @@
 {
+<<<<<<< Updated upstream
     "idf.currentSetup": "/Users/joshuafrost/.espressif/v5.5/esp-idf",
     "idf.port": "/dev/tty.usbserial-21330",
     "idf.flashType": "UART"
 }
+=======
+  "idf.currentSetup": "/Users/joshuafrost/.espressif/v5.5/esp-idf",
+  "clangd.path": "C:\\Users\\Josh\\.espressif\\tools\\esp-clang\\esp-19.1.2_20250312\\esp-clang\\bin\\clangd.exe",
+  "clangd.arguments": [
+    "--background-index",
+    "--query-driver=**",
+    "--compile-commands-dir=c:\\Users\\Josh\\Desktop\\uni proj iot\\Advanced-IoT-Mine-Safety-Monorepo\\PiBasestation\\ESP32BasestationFirmware\\build"
+  ]
+}
+>>>>>>> Stashed changes

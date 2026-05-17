@@ -69,7 +69,6 @@
 #define AUDIO_QUEUE_FLUSH_DELAY_MS 5
 #define AUDIO_SEND_TIMEOUT_MS 100
 #define SENSOR_SEND_TIMEOUT_MS 500
-#define QUEUE_FLUSH_DELAY_MS 50
 #define QUEUE_RETRY_DELAY_MS 250
 
 #define AUDIO_CHUNK_FILE_PREFIX     "aud_"
@@ -95,8 +94,6 @@ static battery_probe_reading_t last_battery_reading = {0};
 static bool battery_reading_valid = false;
 static volatile bool audio_active = false;
 static uint8_t base_station_mac[6] = {0};
-static uint32_t s_next_sensor_seq = 0;
-static uint32_t s_next_audio_seq = 0;
 static uint32_t s_sensor_sample_sequence = 0;
 static bool s_diagnostic_mode = false;
 static volatile TickType_t s_sensor_resume_tick = 0;
@@ -147,15 +144,11 @@ static bool matches_json_field(const char *json, const char *field_name, const c
 static bool parse_json_int64_field(const char *json, const char *field_name, int64_t *out_value);
 static bool get_synced_epoch_ms(int64_t *out_ms);
 static void normalize_json_string(const uint8_t *data, int len, char *buffer, size_t buffer_len);
-static const char *queue_kind_prefix(queue_kind_t kind);
-static uint32_t *queue_kind_next_seq(queue_kind_t kind);
 static esp_err_t init_persistent_queue(void);
 static esp_err_t refresh_queue_sequence_counters(void);
 static esp_err_t enqueue_packet(queue_kind_t kind, const uint8_t *data, size_t len);
-static bool find_oldest_packet_path(queue_kind_t kind, char *path, size_t path_len, uint32_t *out_seq);
 static size_t count_queued_packets(queue_kind_t kind);
-static bool flush_next_queued_packet(uint32_t *failed_transmission_attempts);
-static bool flush_persistent_queues(uint32_t *failed_transmission_attempts);
+static bool send_sensor_payload(const char *json, size_t json_len, uint32_t *failed_transmission_attempts);
 static bool nvs_load_offline_flag(void);
 static void nvs_store_offline_flag(bool offline);
 static void button_gpio_init(void);
@@ -203,16 +196,6 @@ static void normalize_json_string(const uint8_t *data, int len, char *buffer, si
     }
 
     buffer[out_index] = '\0';
-}
-
-static const char *queue_kind_prefix(queue_kind_t kind)
-{
-    return kind == QUEUE_KIND_AUDIO ? AUDIO_CHUNK_FILE_PREFIX : "sensor_";
-}
-
-static uint32_t *queue_kind_next_seq(queue_kind_t kind)
-{
-    return kind == QUEUE_KIND_AUDIO ? &s_next_audio_seq : &s_next_sensor_seq;
 }
 
 static void audio_chunk_path(char *buf, size_t buf_len, uint32_t session_id, uint16_t seq_num)
@@ -268,8 +251,7 @@ static esp_err_t refresh_queue_sequence_counters(void)
 {
     DIR *dir = opendir(STORAGE_SCAN_PATH);
     struct dirent *entry = NULL;
-    uint32_t max_sensor_seq = 0;
-    bool sensor_found = false;
+    unsigned removed_sensor_packets = 0;
 
     if (dir == NULL) {
         ESP_LOGE(TAG, "Failed to open queue storage directory: errno=%d", errno);
@@ -280,9 +262,9 @@ static esp_err_t refresh_queue_sequence_counters(void)
         uint32_t seq = 0;
 
         if (sscanf(entry->d_name, "sensor_%" SCNu32 ".bin", &seq) == 1) {
-            if (!sensor_found || seq > max_sensor_seq) {
-                max_sensor_seq = seq;
-                sensor_found = true;
+            char path[STORAGE_PATH_MAX];
+            if (build_storage_entry_path(path, sizeof(path), entry->d_name) && unlink(path) == 0) {
+                removed_sensor_packets++;
             }
         }
         /* Audio chunks are addressed by (session_id, seq_num) embedded in their
@@ -290,8 +272,9 @@ static esp_err_t refresh_queue_sequence_counters(void)
     }
 
     closedir(dir);
-    s_next_sensor_seq = sensor_found ? (max_sensor_seq + 1U) : 0U;
-    s_next_audio_seq = 0U;  /* unused under the per-session naming scheme */
+    if (removed_sensor_packets > 0U) {
+        ESP_LOGI(TAG, "Removed %u stale queued sensor payload(s)", removed_sensor_packets);
+    }
 
     ESP_LOGI(TAG, "Recovered queued packets: %u audio, %u sensor",
              (unsigned)count_queued_packets(QUEUE_KIND_AUDIO),
@@ -305,24 +288,18 @@ static esp_err_t enqueue_packet(queue_kind_t kind, const uint8_t *data, size_t l
     FILE *file = NULL;
     size_t written = 0;
 
-    if (data == NULL || len == 0U || len > STORAGE_READ_BUFFER_MAX) {
+    if (kind != QUEUE_KIND_AUDIO || data == NULL || len == 0U || len > STORAGE_READ_BUFFER_MAX) {
         return ESP_ERR_INVALID_ARG;
     }
 
-    if (kind == QUEUE_KIND_AUDIO) {
-        if (len < AUDIO_CHUNK_HDR_SIZE) {
-            return ESP_ERR_INVALID_ARG;
-        }
-        const audio_chunk_header_t *hdr = (const audio_chunk_header_t *)data;
-        if (hdr->msg_type != AUDIO_MSG_TYPE) {
-            return ESP_ERR_INVALID_ARG;
-        }
-        audio_chunk_path(path, sizeof(path), hdr->session_id, hdr->seq_num);
-    } else {
-        uint32_t seq = *queue_kind_next_seq(kind);
-        snprintf(path, sizeof(path), STORAGE_BASE_PATH "/%s%" PRIu32 ".bin",
-                 queue_kind_prefix(kind), seq);
+    if (len < AUDIO_CHUNK_HDR_SIZE) {
+        return ESP_ERR_INVALID_ARG;
     }
+    const audio_chunk_header_t *hdr = (const audio_chunk_header_t *)data;
+    if (hdr->msg_type != AUDIO_MSG_TYPE) {
+        return ESP_ERR_INVALID_ARG;
+    }
+    audio_chunk_path(path, sizeof(path), hdr->session_id, hdr->seq_num);
 
     file = fopen(path, "wb");
     if (file == NULL) {
@@ -344,83 +321,9 @@ static esp_err_t enqueue_packet(queue_kind_t kind, const uint8_t *data, size_t l
         return ESP_FAIL;
     }
 
-    if (kind == QUEUE_KIND_AUDIO) {
-        const audio_chunk_header_t *hdr = (const audio_chunk_header_t *)data;
-        ESP_LOGI(TAG, "Queued audio chunk sid=%08" PRIX32 " seq=%u (%u bytes)",
-                 hdr->session_id, (unsigned)hdr->seq_num, (unsigned)len);
-    } else {
-        uint32_t seq = *queue_kind_next_seq(kind);
-        (*queue_kind_next_seq(kind))++;
-        ESP_LOGI(TAG, "Queued sensor packet %" PRIu32 " (%u bytes)", seq, (unsigned)len);
-    }
+    ESP_LOGI(TAG, "Queued audio chunk sid=%08" PRIX32 " seq=%u (%u bytes)",
+             hdr->session_id, (unsigned)hdr->seq_num, (unsigned)len);
     return ESP_OK;
-}
-
-static bool find_oldest_packet_path(queue_kind_t kind, char *path, size_t path_len, uint32_t *out_seq)
-{
-    DIR *dir = NULL;
-    struct dirent *entry = NULL;
-    bool found = false;
-
-    if (path == NULL || path_len == 0U) {
-        return false;
-    }
-
-    dir = opendir(STORAGE_SCAN_PATH);
-    if (dir == NULL) {
-        ESP_LOGE(TAG, "Failed to open queue directory: errno=%d", errno);
-        return false;
-    }
-
-    if (kind == QUEUE_KIND_AUDIO) {
-        /* Audio chunks are named aud_<sid:08X>_<seq:05u>.bin. Lexicographic
-         * min picks the oldest session, then the lowest seq within it. */
-        char oldest_name[32] = {0};
-        while ((entry = readdir(dir)) != NULL) {
-            uint32_t sid = 0;
-            uint16_t seq = 0;
-            if (!parse_audio_chunk_name(entry->d_name, &sid, &seq)) {
-                continue;
-            }
-            if (!found || strcmp(entry->d_name, oldest_name) < 0) {
-                strncpy(oldest_name, entry->d_name, sizeof(oldest_name) - 1U);
-                oldest_name[sizeof(oldest_name) - 1U] = '\0';
-                found = true;
-            }
-        }
-        closedir(dir);
-        if (!found) {
-            return false;
-        }
-        snprintf(path, path_len, STORAGE_BASE_PATH "/%s", oldest_name);
-        if (out_seq != NULL) {
-            *out_seq = 0U;  /* not meaningful for audio; caller can re-parse */
-        }
-        return true;
-    }
-
-    char pattern[32];
-    uint32_t oldest_seq = UINT32_MAX;
-    snprintf(pattern, sizeof(pattern), "%s%%" SCNu32 ".bin", queue_kind_prefix(kind));
-    while ((entry = readdir(dir)) != NULL) {
-        uint32_t seq = 0;
-
-        if (sscanf(entry->d_name, pattern, &seq) == 1 && seq < oldest_seq) {
-            oldest_seq = seq;
-            found = true;
-        }
-    }
-
-    closedir(dir);
-    if (!found) {
-        return false;
-    }
-
-    snprintf(path, path_len, STORAGE_BASE_PATH "/%s%" PRIu32 ".bin", queue_kind_prefix(kind), oldest_seq);
-    if (out_seq != NULL) {
-        *out_seq = oldest_seq;
-    }
-    return true;
 }
 
 static size_t count_queued_packets(queue_kind_t kind)
@@ -428,7 +331,6 @@ static size_t count_queued_packets(queue_kind_t kind)
     DIR *dir = opendir(STORAGE_SCAN_PATH);
     struct dirent *entry = NULL;
     size_t count = 0;
-    char pattern[32];
 
     if (dir == NULL) {
         return 0U;
@@ -444,10 +346,9 @@ static size_t count_queued_packets(queue_kind_t kind)
         return count;
     }
 
-    snprintf(pattern, sizeof(pattern), "%s%%" SCNu32 ".bin", queue_kind_prefix(kind));
     while ((entry = readdir(dir)) != NULL) {
         uint32_t seq = 0;
-        if (sscanf(entry->d_name, pattern, &seq) == 1) {
+        if (sscanf(entry->d_name, "sensor_%" SCNu32 ".bin", &seq) == 1) {
             count++;
         }
     }
@@ -456,109 +357,37 @@ static size_t count_queued_packets(queue_kind_t kind)
     return count;
 }
 
-static bool flush_next_queued_packet(uint32_t *failed_transmission_attempts)
+static bool send_sensor_payload(const char *json, size_t json_len, uint32_t *failed_transmission_attempts)
 {
-    uint8_t packet_buffer[STORAGE_READ_BUFFER_MAX];
-    queue_kind_t kind = QUEUE_KIND_AUDIO;
-    char path[STORAGE_PATH_MAX];
-    uint32_t seq = 0;
-    FILE *file = NULL;
-    size_t payload_len = 0;
     bool delivered = false;
-    esp_err_t err = ESP_OK;
-    uint32_t send_timeout_ms = SENSOR_SEND_TIMEOUT_MS;
+    esp_err_t err;
 
-    if (audio_active) {
+    if (json == NULL || json_len == 0U) {
         return false;
     }
 
-    /* Audio chunks are owned by the session lifecycle (initial send +
-     * retransmit on NACK/timeout); the generic queue flusher only drains
-     * sensor packets. */
-    kind = QUEUE_KIND_SENSOR;
-    if (!find_oldest_packet_path(kind, path, sizeof(path), &seq)) {
-        return true;
-    }
-
-    file = fopen(path, "rb");
-    if (file == NULL) {
-        ESP_LOGW(TAG, "Queued packet disappeared before send: %s", path);
-        return true;
-    }
-
-    payload_len = fread(packet_buffer, 1, sizeof(packet_buffer), file);
-    if (ferror(file) != 0) {
-        ESP_LOGE(TAG, "Failed reading queued packet %s", path);
-        fclose(file);
-        if (failed_transmission_attempts != NULL) {
-            (*failed_transmission_attempts)++;
-        }
-        return false;
-    }
-    fclose(file);
-
-    if (payload_len == 0U) {
-        ESP_LOGW(TAG, "Removing empty queued packet %s", path);
-        unlink(path);
-        return true;
-    }
-
-    if (audio_active) {
-        return false;
-    }
-
-    send_timeout_ms = (kind == QUEUE_KIND_AUDIO) ? AUDIO_SEND_TIMEOUT_MS : SENSOR_SEND_TIMEOUT_MS;
-    err = espnow_manager_send_and_wait(packet_buffer, payload_len, send_timeout_ms, &delivered);
-    if (err != ESP_OK) {
-        ESP_LOGE(TAG, "espnow_manager_send failed while flushing %s queue: %s",
-                 kind == QUEUE_KIND_AUDIO ? "audio" : "sensor",
-                 esp_err_to_name(err));
+    if (s_offline_mode) {
+        ESP_LOGW(TAG, "Dropping sensor sample while offline: %s", json);
         if (failed_transmission_attempts != NULL) {
             (*failed_transmission_attempts)++;
         }
         return false;
     }
 
-    if (!delivered) {
-        ESP_LOGW(TAG, "ESP-NOW delivery failed while flushing %s queue",
-                 kind == QUEUE_KIND_AUDIO ? "audio" : "sensor");
+    err = espnow_manager_send_and_wait((const uint8_t *)json, json_len,
+                                       SENSOR_SEND_TIMEOUT_MS, &delivered);
+    if (err != ESP_OK || !delivered) {
+        ESP_LOGW(TAG, "Sensor sample send failed, dropping payload: %s",
+                 err != ESP_OK ? esp_err_to_name(err) : "no MAC ACK");
         if (failed_transmission_attempts != NULL) {
             (*failed_transmission_attempts)++;
         }
         return false;
     }
 
-    if (unlink(path) != 0) {
-        ESP_LOGE(TAG, "Failed to delete sent queue file %s: errno=%d", path, errno);
-        if (failed_transmission_attempts != NULL) {
-            (*failed_transmission_attempts)++;
-        }
-        return false;
-    }
-
-    ESP_LOGI(TAG, "Sent queued %s packet %" PRIu32 " (%u bytes, %u audio pending, %u sensor pending)",
-             kind == QUEUE_KIND_AUDIO ? "audio" : "sensor",
-             seq,
-             (unsigned)payload_len,
-             (unsigned)count_queued_packets(QUEUE_KIND_AUDIO),
-             (unsigned)count_queued_packets(QUEUE_KIND_SENSOR));
+    ESP_LOGI(TAG, "Sensor sample sent: %s", json);
     if (failed_transmission_attempts != NULL) {
         *failed_transmission_attempts = 0;
-    }
-
-    return true;
-}
-
-static bool flush_persistent_queues(uint32_t *failed_transmission_attempts)
-{
-    /* Only sensor packets are drained here. Audio chunks are owned by the
-     * session lifecycle (initial send happens inline; retransmits happen
-     * via NACK/timeout in audio_session_monitor_task). */
-    while (count_queued_packets(QUEUE_KIND_SENSOR) > 0U) {
-        if (!flush_next_queued_packet(failed_transmission_attempts)) {
-            return false;
-        }
-        vTaskDelay(pdMS_TO_TICKS(QUEUE_FLUSH_DELAY_MS));
     }
     return true;
 }
@@ -1701,28 +1530,8 @@ static void send_task(void *pvParameters)
                 format_payload(json, sizeof(json), failed_transmission_attempts, s_sensor_sample_sequence++);
 
                 size_t json_len = strlen(json);
-                if (enqueue_packet(QUEUE_KIND_SENSOR, (const uint8_t *)json, json_len) != ESP_OK) {
-                    failed_transmission_attempts++;
-                    next_measurement_tick = now + pdMS_TO_TICKS(SEND_INTERVAL_MS);
-                    vTaskDelay(pdMS_TO_TICKS(SEND_INTERVAL_MS));
-                    continue;
-                }
-
-                ESP_LOGI(TAG, "Diagnostic sensor sample queued: %s", json);
+                (void)send_sensor_payload(json, json_len, &failed_transmission_attempts);
                 next_measurement_tick = now + pdMS_TO_TICKS(SEND_INTERVAL_MS);
-            }
-
-            bool has_pending_packets = count_queued_packets(QUEUE_KIND_AUDIO) > 0U ||
-                                       count_queued_packets(QUEUE_KIND_SENSOR) > 0U;
-
-            if (!s_offline_mode && has_pending_packets && !audio_active) {
-                if (!flush_next_queued_packet(&failed_transmission_attempts)) {
-                    ESP_LOGI(TAG, "Diagnostic queue send paused with %u audio and %u sensor payload(s) pending",
-                             (unsigned)count_queued_packets(QUEUE_KIND_AUDIO),
-                             (unsigned)count_queued_packets(QUEUE_KIND_SENSOR));
-                    vTaskDelay(pdMS_TO_TICKS(QUEUE_RETRY_DELAY_MS));
-                    continue;
-                }
             }
 
             now = xTaskGetTickCount();
@@ -1737,9 +1546,6 @@ static void send_task(void *pvParameters)
             continue;
         }
 
-        bool has_pending_packets = count_queued_packets(QUEUE_KIND_AUDIO) > 0U ||
-                                   count_queued_packets(QUEUE_KIND_SENSOR) > 0U;
-
         if (measurement_due) {
             if (audio_active) {
                 next_measurement_tick = xTaskGetTickCount() + pdMS_TO_TICKS(SEND_INTERVAL_MS);
@@ -1750,35 +1556,12 @@ static void send_task(void *pvParameters)
             format_payload(json, sizeof(json), failed_transmission_attempts, s_sensor_sample_sequence++);
 
             size_t json_len = strlen(json);
-            if (enqueue_packet(QUEUE_KIND_SENSOR, (const uint8_t *)json, json_len) != ESP_OK) {
-                failed_transmission_attempts++;
-                next_measurement_tick = now + pdMS_TO_TICKS(SEND_INTERVAL_MS);
-                vTaskDelay(pdMS_TO_TICKS(SEND_INTERVAL_MS));
-                continue;
-            }
-
-            has_pending_packets = true;
+            (void)send_sensor_payload(json, json_len, &failed_transmission_attempts);
             next_measurement_tick = now + pdMS_TO_TICKS(SEND_INTERVAL_MS);
-        }
-
-        if (!s_offline_mode && has_pending_packets &&
-            (count_queued_packets(QUEUE_KIND_SENSOR) > 1U || count_queued_packets(QUEUE_KIND_AUDIO) > 0U || measurement_due)) {
-            ESP_LOGI(TAG, "Queued payloads pending (%u audio, %u sensor)",
-                     (unsigned)count_queued_packets(QUEUE_KIND_AUDIO),
-                     (unsigned)count_queued_packets(QUEUE_KIND_SENSOR));
         }
 
         if (audio_active) {
             vTaskDelay(pdMS_TO_TICKS(50));
-            continue;
-        }
-
-        if (!s_offline_mode && has_pending_packets &&
-            !flush_persistent_queues(&failed_transmission_attempts)) {
-            ESP_LOGI(TAG, "Queue flush paused with %u audio and %u sensor payload(s) pending",
-                     (unsigned)count_queued_packets(QUEUE_KIND_AUDIO),
-                     (unsigned)count_queued_packets(QUEUE_KIND_SENSOR));
-            vTaskDelay(pdMS_TO_TICKS(QUEUE_RETRY_DELAY_MS));
             continue;
         }
 
@@ -1799,11 +1582,6 @@ void app_main(void)
 {
     bool diagnostic_mode = true;
     s_diagnostic_mode = diagnostic_mode;
-
-    esp_err_t early_web_monitor_err = web_monitor_manager_early_init();
-    if (early_web_monitor_err != ESP_OK) {
-        ESP_LOGW(TAG, "Early web monitor capture init failed: %s", esp_err_to_name(early_web_monitor_err));
-    }
 
     ESP_ERROR_CHECK(led_manager_init(LED_GPIO, true));
     ESP_ERROR_CHECK(led_manager_set(false));
@@ -1888,32 +1666,10 @@ void app_main(void)
             ESP_LOGE(TAG, "Diagnostic microphone init failed: %s", esp_err_to_name(mic_err));
         }
 
-        const web_monitor_manager_config_t web_monitor_config = {
-            .ap_ssid = WEB_MONITOR_AP_SSID,
-            .ap_password = WEB_MONITOR_AP_PASSWORD,
-            .channel = ESPNOW_CHANNEL,
-            .max_connections = 1,
-        };
-        esp_err_t web_monitor_err = web_monitor_manager_init(&web_monitor_config);
-        if (web_monitor_err != ESP_OK) {
-            ESP_LOGW(TAG, "Web monitor init failed: %s", esp_err_to_name(web_monitor_err));
-        }
-
-        ESP_LOGI(TAG, "Diagnostic mode: button + LED + full audio path + rewritten sensor send path");
+        ESP_LOGI(TAG, "Diagnostic mode: web monitor disabled, ESPNOW path active");
         xTaskCreate(send_task, "send_task", 4096, NULL, 4, NULL);
         xTaskCreate(audio_session_monitor_task, "audio_session_mon", 8192, NULL, 4, NULL);
     } else {
-        const web_monitor_manager_config_t web_monitor_config = {
-            .ap_ssid = WEB_MONITOR_AP_SSID,
-            .ap_password = WEB_MONITOR_AP_PASSWORD,
-            .channel = ESPNOW_CHANNEL,
-            .max_connections = 1,
-        };
-        esp_err_t web_monitor_err = web_monitor_manager_init(&web_monitor_config);
-        if (web_monitor_err != ESP_OK) {
-            ESP_LOGW(TAG, "Web monitor init failed: %s", esp_err_to_name(web_monitor_err));
-        }
-
         const i2c_manager_config_t i2c_config = {
             .port = I2C_PORT_NUM,
             .sda_io_num = I2C_SDA_GPIO,
@@ -2009,5 +1765,4 @@ void app_main(void)
     xTaskCreate(button_task, "button_task", 8192, NULL, 5, NULL);
 
     ESP_LOGI(TAG, "Diagnostic firmware ready");
-    web_monitor_manager_finalize_startup_history();
 }
