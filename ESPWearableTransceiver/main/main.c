@@ -30,7 +30,6 @@
 #include "audio_protocol.h"
 #include "ws2812_manager.h"
 #include "status_led_manager.h"
-#include "web_monitor_manager.h"
 
 /* Hardware configuration */
 #define I2C_SDA_GPIO 18
@@ -53,14 +52,13 @@
 #define MIC_I2S_DIN_GPIO  GPIO_NUM_25
 #define BUTTON_GPIO       GPIO_NUM_14
 #define WS2812_GPIO       GPIO_NUM_12
-#define WEB_MONITOR_AP_SSID     "ESPWearableMonitor"
-#define WEB_MONITOR_AP_PASSWORD "wearable123"
 
 #define AUDIO_SAMPLE_RATE    8000
 #define AUDIO_MAX_SECONDS    5
 #define AUDIO_MAX_SAMPLES    (AUDIO_SAMPLE_RATE * AUDIO_MAX_SECONDS)
 #define MIC_READ_CHUNK       512
 #define BUTTON_DEBOUNCE_MS   50
+#define AUDIO_BOOT_LOCKOUT_MS 5000
 #define JSON_PAYLOAD_MAX_LEN 512
 #define STORAGE_BASE_PATH    "/spiffs"
 #define STORAGE_SCAN_PATH    STORAGE_BASE_PATH "/"
@@ -72,11 +70,13 @@
 #define QUEUE_RETRY_DELAY_MS 250
 
 #define AUDIO_CHUNK_FILE_PREFIX     "aud_"
+#define SENSOR_FILE_PREFIX          "sensor_"
 #define AUDIO_SESSION_MAX_PENDING   4
 #define AUDIO_SESSION_DEADLINE_MS   30000
 #define AUDIO_SESSION_QUIET_MS      5000
 #define AUDIO_INTER_CHUNK_DELAY_MS  5
 #define SESSION_NVS_BOOT_CTR_KEY    "boot_ctr"
+#define DUMP_SEND_TIMEOUT_MS        75
 
 /* Application configuration */
 #define SEND_INTERVAL_MS 5000
@@ -95,8 +95,11 @@ static bool battery_reading_valid = false;
 static volatile bool audio_active = false;
 static uint8_t base_station_mac[6] = {0};
 static uint32_t s_sensor_sample_sequence = 0;
+static uint32_t s_sensor_queue_next_seq = 0;
 static bool s_diagnostic_mode = false;
 static volatile TickType_t s_sensor_resume_tick = 0;
+static TickType_t s_boot_tick = 0;
+static TickType_t s_audio_enable_tick = 0;
 
 static volatile bool       s_time_synced     = false;
 static volatile int64_t    s_sync_epoch_ms   = 0;
@@ -104,6 +107,13 @@ static volatile TickType_t s_sync_local_tick = 0;
 static portMUX_TYPE        s_time_sync_mux   = portMUX_INITIALIZER_UNLOCKED;
 
 static volatile bool s_offline_mode = false;
+static volatile bool s_dump_in_progress = false;
+static volatile bool s_dump_task_started = false;
+static portMUX_TYPE s_dump_mux = portMUX_INITIALIZER_UNLOCKED;
+static TaskHandle_t s_send_task_handle = NULL;
+static TaskHandle_t s_button_task_handle = NULL;
+static TaskHandle_t s_audio_monitor_task_handle = NULL;
+static TaskHandle_t s_dump_task_handle = NULL;
 
 typedef struct {
     bool       in_use;
@@ -116,12 +126,16 @@ typedef struct {
 static pending_audio_session_t s_pending_sessions[AUDIO_SESSION_MAX_PENDING] = {0};
 static portMUX_TYPE s_pending_sessions_mux = portMUX_INITIALIZER_UNLOCKED;
 
+typedef struct {
+    uint32_t seq;
+    char name[32];
+} sensor_queue_entry_t;
+
 static uint16_t s_session_id_boot_ctr = 0;
 static uint16_t s_session_id_next_low = 0;
 
 #define OFFLINE_MAX_AUDIO_RECORDINGS 5U
 #define OFFLINE_NVS_NAMESPACE "wearable"
-#define OFFLINE_NVS_KEY       "offline"
 
 typedef enum {
     QUEUE_KIND_SENSOR = 0,
@@ -146,16 +160,14 @@ static bool get_synced_epoch_ms(int64_t *out_ms);
 static void normalize_json_string(const uint8_t *data, int len, char *buffer, size_t buffer_len);
 static esp_err_t init_persistent_queue(void);
 static esp_err_t refresh_queue_sequence_counters(void);
+static esp_err_t clear_sensor_queue(void);
 static esp_err_t enqueue_packet(queue_kind_t kind, const uint8_t *data, size_t len);
 static size_t count_queued_packets(queue_kind_t kind);
 static bool send_sensor_payload(const char *json, size_t json_len, uint32_t *failed_transmission_attempts);
-static bool nvs_load_offline_flag(void);
-static void nvs_store_offline_flag(bool offline);
 static void button_gpio_init(void);
 static bool button_pressed(void);
 static bool build_storage_entry_path(char *path, size_t path_len, const char *entry_name);
 static bool button_held_at_boot(void);
-static bool probe_basestation_for(uint32_t timeout_ms);
 static size_t count_queued_audio_recordings(void);
 static esp_err_t drop_oldest_audio_recording(void);
 static void audio_chunk_path(char *buf, size_t buf_len, uint32_t session_id, uint16_t seq_num);
@@ -173,6 +185,8 @@ static void handle_audio_nack(const uint8_t *data, int len);
 static void handle_audio_ack(const uint8_t *data, int len);
 static void audio_session_monitor_task(void *pvParameters);
 static void audio_recovery_scan_on_boot(void);
+static void arm_sensor_dump(void);
+static void sensor_dump_task(void *pvParameters);
 
 static void log_sensor_error(const char *sensor_name, esp_err_t err)
 {
@@ -251,7 +265,8 @@ static esp_err_t refresh_queue_sequence_counters(void)
 {
     DIR *dir = opendir(STORAGE_SCAN_PATH);
     struct dirent *entry = NULL;
-    unsigned removed_sensor_packets = 0;
+    uint32_t max_sensor_seq = 0;
+    bool saw_sensor = false;
 
     if (dir == NULL) {
         ESP_LOGE(TAG, "Failed to open queue storage directory: errno=%d", errno);
@@ -262,23 +277,50 @@ static esp_err_t refresh_queue_sequence_counters(void)
         uint32_t seq = 0;
 
         if (sscanf(entry->d_name, "sensor_%" SCNu32 ".bin", &seq) == 1) {
-            char path[STORAGE_PATH_MAX];
-            if (build_storage_entry_path(path, sizeof(path), entry->d_name) && unlink(path) == 0) {
-                removed_sensor_packets++;
+            if (!saw_sensor || seq > max_sensor_seq) {
+                max_sensor_seq = seq;
             }
+            saw_sensor = true;
         }
         /* Audio chunks are addressed by (session_id, seq_num) embedded in their
          * filenames and do not use a monotonic queue counter. */
     }
 
     closedir(dir);
-    if (removed_sensor_packets > 0U) {
-        ESP_LOGI(TAG, "Removed %u stale queued sensor payload(s)", removed_sensor_packets);
-    }
+    s_sensor_queue_next_seq = saw_sensor ? (max_sensor_seq + 1U) : 0U;
 
     ESP_LOGI(TAG, "Recovered queued packets: %u audio, %u sensor",
              (unsigned)count_queued_packets(QUEUE_KIND_AUDIO),
              (unsigned)count_queued_packets(QUEUE_KIND_SENSOR));
+    return ESP_OK;
+}
+
+static esp_err_t clear_sensor_queue(void)
+{
+    DIR *dir = opendir(STORAGE_SCAN_PATH);
+    struct dirent *entry = NULL;
+    unsigned removed_sensor_packets = 0;
+
+    if (dir == NULL) {
+        ESP_LOGE(TAG, "Failed to open queue storage directory: errno=%d", errno);
+        return ESP_FAIL;
+    }
+
+    while ((entry = readdir(dir)) != NULL) {
+        uint32_t seq = 0;
+        if (sscanf(entry->d_name, SENSOR_FILE_PREFIX "%" SCNu32 ".bin", &seq) == 1) {
+            char path[STORAGE_PATH_MAX];
+            if (build_storage_entry_path(path, sizeof(path), entry->d_name) && unlink(path) == 0) {
+                removed_sensor_packets++;
+            }
+        }
+    }
+
+    closedir(dir);
+    s_sensor_queue_next_seq = 0;
+    if (removed_sensor_packets > 0U) {
+        ESP_LOGI(TAG, "Removed %u queued offline sensor payload(s)", removed_sensor_packets);
+    }
     return ESP_OK;
 }
 
@@ -288,18 +330,28 @@ static esp_err_t enqueue_packet(queue_kind_t kind, const uint8_t *data, size_t l
     FILE *file = NULL;
     size_t written = 0;
 
-    if (kind != QUEUE_KIND_AUDIO || data == NULL || len == 0U || len > STORAGE_READ_BUFFER_MAX) {
+    if (data == NULL || len == 0U || len > STORAGE_READ_BUFFER_MAX) {
         return ESP_ERR_INVALID_ARG;
     }
 
-    if (len < AUDIO_CHUNK_HDR_SIZE) {
+    if (kind == QUEUE_KIND_AUDIO) {
+        if (len < AUDIO_CHUNK_HDR_SIZE) {
+            return ESP_ERR_INVALID_ARG;
+        }
+        const audio_chunk_header_t *hdr = (const audio_chunk_header_t *)data;
+        if (hdr->msg_type != AUDIO_MSG_TYPE) {
+            return ESP_ERR_INVALID_ARG;
+        }
+        audio_chunk_path(path, sizeof(path), hdr->session_id, hdr->seq_num);
+    } else if (kind == QUEUE_KIND_SENSOR) {
+        int written_len = snprintf(path, sizeof(path), STORAGE_BASE_PATH "/" SENSOR_FILE_PREFIX "%" PRIu32 ".bin",
+                                   s_sensor_queue_next_seq++);
+        if (written_len < 0 || (size_t)written_len >= sizeof(path)) {
+            return ESP_ERR_INVALID_SIZE;
+        }
+    } else {
         return ESP_ERR_INVALID_ARG;
     }
-    const audio_chunk_header_t *hdr = (const audio_chunk_header_t *)data;
-    if (hdr->msg_type != AUDIO_MSG_TYPE) {
-        return ESP_ERR_INVALID_ARG;
-    }
-    audio_chunk_path(path, sizeof(path), hdr->session_id, hdr->seq_num);
 
     file = fopen(path, "wb");
     if (file == NULL) {
@@ -321,8 +373,13 @@ static esp_err_t enqueue_packet(queue_kind_t kind, const uint8_t *data, size_t l
         return ESP_FAIL;
     }
 
-    ESP_LOGI(TAG, "Queued audio chunk sid=%08" PRIX32 " seq=%u (%u bytes)",
-             hdr->session_id, (unsigned)hdr->seq_num, (unsigned)len);
+    if (kind == QUEUE_KIND_AUDIO) {
+        const audio_chunk_header_t *hdr = (const audio_chunk_header_t *)data;
+        ESP_LOGI(TAG, "Queued audio chunk sid=%08" PRIX32 " seq=%u (%u bytes)",
+                 hdr->session_id, (unsigned)hdr->seq_num, (unsigned)len);
+    } else {
+        ESP_LOGI(TAG, "Queued offline sensor payload %s (%u bytes)", path, (unsigned)len);
+    }
     return ESP_OK;
 }
 
@@ -366,12 +423,25 @@ static bool send_sensor_payload(const char *json, size_t json_len, uint32_t *fai
         return false;
     }
 
-    if (s_offline_mode) {
-        ESP_LOGW(TAG, "Dropping sensor sample while offline: %s", json);
-        if (failed_transmission_attempts != NULL) {
-            (*failed_transmission_attempts)++;
-        }
+    if (s_dump_in_progress) {
+        ESP_LOGW(TAG, "Suppressing sensor sample while dump is active");
         return false;
+    }
+
+    if (s_offline_mode) {
+        err = enqueue_packet(QUEUE_KIND_SENSOR, (const uint8_t *)json, json_len);
+        if (err != ESP_OK) {
+            ESP_LOGW(TAG, "Failed to persist offline sensor sample: %s", esp_err_to_name(err));
+            if (failed_transmission_attempts != NULL) {
+                (*failed_transmission_attempts)++;
+            }
+            return false;
+        }
+        ESP_LOGI(TAG, "Sensor sample persisted offline: %s", json);
+        if (failed_transmission_attempts != NULL) {
+            *failed_transmission_attempts = 0;
+        }
+        return true;
     }
 
     err = espnow_manager_send_and_wait((const uint8_t *)json, json_len,
@@ -390,6 +460,20 @@ static bool send_sensor_payload(const char *json, size_t json_len, uint32_t *fai
         *failed_transmission_attempts = 0;
     }
     return true;
+}
+
+static int compare_sensor_queue_entries(const void *a, const void *b)
+{
+    const sensor_queue_entry_t *entry_a = (const sensor_queue_entry_t *)a;
+    const sensor_queue_entry_t *entry_b = (const sensor_queue_entry_t *)b;
+
+    if (entry_a->seq < entry_b->seq) {
+        return -1;
+    }
+    if (entry_a->seq > entry_b->seq) {
+        return 1;
+    }
+    return 0;
 }
 
 static bool matches_json_field(const char *json, const char *field_name, const char *field_value)
@@ -470,6 +554,9 @@ static void handle_base_station_message(const uint8_t *mac_addr, const uint8_t *
     case AUDIO_ACK_MSG_TYPE:
         handle_audio_ack(data, len);
         return;
+    case DUMP_REQUEST_MSG_TYPE:
+        arm_sensor_dump();
+        return;
     default:
         break;
     }
@@ -520,39 +607,6 @@ static void format_optional_float(char *buffer, size_t buffer_len, bool has_valu
     snprintf(buffer, buffer_len, "%.*f", decimals, value);
 }
 
-static bool nvs_load_offline_flag(void)
-{
-    nvs_handle_t handle;
-    esp_err_t err = nvs_open(OFFLINE_NVS_NAMESPACE, NVS_READONLY, &handle);
-    if (err != ESP_OK) {
-        return false;
-    }
-
-    uint8_t value = 0;
-    err = nvs_get_u8(handle, OFFLINE_NVS_KEY, &value);
-    nvs_close(handle);
-    return err == ESP_OK && value != 0;
-}
-
-static void nvs_store_offline_flag(bool offline)
-{
-    nvs_handle_t handle;
-    esp_err_t err = nvs_open(OFFLINE_NVS_NAMESPACE, NVS_READWRITE, &handle);
-    if (err != ESP_OK) {
-        ESP_LOGW(TAG, "nvs_open(%s) failed: %s", OFFLINE_NVS_NAMESPACE, esp_err_to_name(err));
-        return;
-    }
-
-    err = nvs_set_u8(handle, OFFLINE_NVS_KEY, offline ? 1 : 0);
-    if (err == ESP_OK) {
-        err = nvs_commit(handle);
-    }
-    if (err != ESP_OK) {
-        ESP_LOGW(TAG, "Failed to persist offline flag: %s", esp_err_to_name(err));
-    }
-    nvs_close(handle);
-}
-
 static void button_gpio_init(void)
 {
     gpio_set_direction(BUTTON_GPIO, GPIO_MODE_INPUT);
@@ -588,23 +642,6 @@ static bool button_held_at_boot(void)
     }
     vTaskDelay(pdMS_TO_TICKS(BUTTON_DEBOUNCE_MS));
     return button_pressed();
-}
-
-static bool probe_basestation_for(uint32_t timeout_ms)
-{
-    const uint8_t probe[1] = { PROBE_MSG_TYPE };
-    const uint32_t per_attempt_ms = 1000;
-    TickType_t deadline = xTaskGetTickCount() + pdMS_TO_TICKS(timeout_ms);
-
-    while ((int32_t)(deadline - xTaskGetTickCount()) > 0) {
-        bool delivered = false;
-        esp_err_t err = espnow_manager_send_and_wait(probe, sizeof(probe), per_attempt_ms, &delivered);
-        if (err == ESP_OK && delivered) {
-            return true;
-        }
-        vTaskDelay(pdMS_TO_TICKS(50));
-    }
-    return false;
 }
 
 static bool read_audio_chunk_header_from_path(const char *path, audio_chunk_header_t *out_hdr)
@@ -944,6 +981,10 @@ static void retransmit_session_all(uint32_t session_id)
 
 static void handle_audio_nack(const uint8_t *data, int len)
 {
+    if (s_dump_in_progress) {
+        return;
+    }
+
     if (len < (int)sizeof(audio_nack_msg_t)) {
         ESP_LOGW(TAG, "NACK packet too short (%d bytes)", len);
         return;
@@ -982,6 +1023,10 @@ static void handle_audio_nack(const uint8_t *data, int len)
 
 static void handle_audio_ack(const uint8_t *data, int len)
 {
+    if (s_dump_in_progress) {
+        return;
+    }
+
     if (len < (int)sizeof(audio_ack_msg_t)) {
         ESP_LOGW(TAG, "ACK packet too short (%d bytes)", len);
         return;
@@ -1016,6 +1061,12 @@ static void audio_session_monitor_task(void *pvParameters)
     audio_recovery_scan_on_boot();
 
     while (1) {
+        if (s_dump_in_progress) {
+            ESP_LOGI(TAG, "Audio session monitor stopping for sensor dump");
+            s_audio_monitor_task_handle = NULL;
+            vTaskDelete(NULL);
+        }
+
         vTaskDelay(pdMS_TO_TICKS(1000));
 
         TickType_t now = xTaskGetTickCount();
@@ -1123,6 +1174,149 @@ static void audio_recovery_scan_on_boot(void)
     if (pending_session_count() > 0U) {
         audio_active = true;
     }
+}
+
+static void arm_sensor_dump(void)
+{
+    bool should_start = false;
+
+    portENTER_CRITICAL(&s_dump_mux);
+    if (!s_dump_task_started) {
+        s_dump_task_started = true;
+        s_dump_in_progress = true;
+        should_start = true;
+    }
+    portEXIT_CRITICAL(&s_dump_mux);
+
+    if (!should_start) {
+        ESP_LOGI(TAG, "Dump request ignored; dump already in progress");
+        return;
+    }
+
+    BaseType_t created = xTaskCreate(sensor_dump_task, "sensor_dump", 8192, NULL, 6, &s_dump_task_handle);
+    if (created != pdPASS) {
+        portENTER_CRITICAL(&s_dump_mux);
+        s_dump_task_started = false;
+        s_dump_in_progress = false;
+        portEXIT_CRITICAL(&s_dump_mux);
+        ESP_LOGE(TAG, "Failed to start sensor dump task");
+    }
+}
+
+static void sensor_dump_task(void *pvParameters)
+{
+    (void)pvParameters;
+
+    audio_active = false;
+    s_sensor_resume_tick = 0;
+    (void)led_manager_set(false);
+    (void)mic_manager_stop();
+
+    ESP_LOGI(TAG, "Offline sensor dump started");
+
+    vTaskDelay(pdMS_TO_TICKS(100));
+
+    DIR *dir = opendir(STORAGE_SCAN_PATH);
+    if (dir == NULL) {
+        ESP_LOGE(TAG, "Failed to open queue storage for dump: errno=%d", errno);
+        goto done;
+    }
+
+    size_t capacity = 32;
+    size_t count = 0;
+    sensor_queue_entry_t *entries = calloc(capacity, sizeof(sensor_queue_entry_t));
+    if (entries == NULL) {
+        closedir(dir);
+        ESP_LOGE(TAG, "Out of heap while preparing sensor dump");
+        goto done;
+    }
+
+    struct dirent *entry = NULL;
+    while ((entry = readdir(dir)) != NULL) {
+        uint32_t seq = 0;
+        if (sscanf(entry->d_name, SENSOR_FILE_PREFIX "%" SCNu32 ".bin", &seq) != 1) {
+            continue;
+        }
+
+        if (count == capacity) {
+            size_t new_capacity = capacity * 2U;
+            sensor_queue_entry_t *new_entries = realloc(entries, new_capacity * sizeof(sensor_queue_entry_t));
+            if (new_entries == NULL) {
+                ESP_LOGW(TAG, "Sensor dump list truncated at %u entries", (unsigned)count);
+                break;
+            }
+            entries = new_entries;
+            capacity = new_capacity;
+        }
+
+        entries[count].seq = seq;
+        strncpy(entries[count].name, entry->d_name, sizeof(entries[count].name) - 1U);
+        entries[count].name[sizeof(entries[count].name) - 1U] = '\0';
+        count++;
+    }
+    closedir(dir);
+
+    qsort(entries, count, sizeof(entries[0]), compare_sensor_queue_entries);
+
+    uint8_t *buffer = malloc(STORAGE_READ_BUFFER_MAX);
+    if (buffer == NULL) {
+        ESP_LOGE(TAG, "Out of heap for sensor dump read buffer");
+        free(entries);
+        goto done;
+    }
+
+    size_t sent = 0;
+    size_t failed = 0;
+    for (size_t i = 0; i < count; i++) {
+        char path[STORAGE_PATH_MAX];
+        if (!build_storage_entry_path(path, sizeof(path), entries[i].name)) {
+            failed++;
+            continue;
+        }
+
+        FILE *file = fopen(path, "rb");
+        if (file == NULL) {
+            if (errno != ENOENT) {
+                ESP_LOGW(TAG, "Dump read open failed for %s: errno=%d", path, errno);
+                failed++;
+            }
+            continue;
+        }
+
+        size_t read_len = fread(buffer, 1, STORAGE_READ_BUFFER_MAX, file);
+        bool read_error = ferror(file) != 0;
+        fclose(file);
+        if (read_error || read_len == 0U) {
+            ESP_LOGW(TAG, "Dump read failed for %s", path);
+            failed++;
+            continue;
+        }
+
+        bool delivered = false;
+        esp_err_t err = espnow_manager_send_and_wait(buffer, read_len, DUMP_SEND_TIMEOUT_MS, &delivered);
+        if (err == ESP_OK && delivered) {
+            if (unlink(path) != 0 && errno != ENOENT) {
+                ESP_LOGW(TAG, "Dump sent but unlink failed for %s: errno=%d", path, errno);
+            }
+            sent++;
+        } else {
+            ESP_LOGW(TAG, "Dump send failed for %s: %s%s",
+                     path, esp_err_to_name(err), delivered ? "" : " no-ack");
+            failed++;
+        }
+    }
+
+    free(buffer);
+    free(entries);
+    ESP_LOGI(TAG, "Offline sensor dump complete: sent=%u failed=%u",
+             (unsigned)sent, (unsigned)failed);
+
+done:
+    portENTER_CRITICAL(&s_dump_mux);
+    s_dump_task_started = false;
+    portEXIT_CRITICAL(&s_dump_mux);
+    s_dump_task_handle = NULL;
+    vTaskDelete(NULL);
 }
 
 static void initialize_sensors(void)
@@ -1302,6 +1496,11 @@ static void format_payload(char *json, size_t json_len, uint32_t transmission_at
 /* Send ADPCM audio as chunked ESP-NOW packets */
 static void send_audio_chunks(const uint8_t *adpcm_data, size_t adpcm_len, uint32_t total_samples)
 {
+    if (s_dump_in_progress) {
+        ESP_LOGW(TAG, "Skipping audio send because sensor dump is active");
+        return;
+    }
+
     uint8_t wifi_mac[6];
     esp_read_mac(wifi_mac, ESP_MAC_WIFI_STA);
 
@@ -1393,6 +1592,23 @@ static void button_task(void *pvParameters)
     }
 
     while (1) {
+        if (s_dump_in_progress) {
+            ESP_LOGI(TAG, "Button task stopping for sensor dump");
+            s_button_task_handle = NULL;
+            vTaskDelete(NULL);
+        }
+
+        TickType_t now = xTaskGetTickCount();
+        if ((int32_t)(s_audio_enable_tick - now) > 0) {
+            if (was_pressed) {
+                was_pressed = false;
+                audio_active = false;
+                (void)led_manager_set(false);
+            }
+            vTaskDelay(pdMS_TO_TICKS(50));
+            continue;
+        }
+
         bool pressed = button_pressed();
         if (pressed != was_pressed) {
             vTaskDelay(pdMS_TO_TICKS(BUTTON_DEBOUNCE_MS));
@@ -1419,7 +1635,7 @@ static void button_task(void *pvParameters)
                         if (led_manager_set(false) != ESP_OK) {
                             ESP_LOGW(TAG, "Failed to clear LED after diagnostic audio allocation failure");
                         }
-                        while (button_pressed()) {
+                        while (!s_dump_in_progress && button_pressed()) {
                             vTaskDelay(pdMS_TO_TICKS(10));
                         }
                         s_sensor_resume_tick = xTaskGetTickCount() + pdMS_TO_TICKS(SEND_INTERVAL_MS);
@@ -1435,14 +1651,14 @@ static void button_task(void *pvParameters)
                         if (led_manager_set(false) != ESP_OK) {
                             ESP_LOGW(TAG, "Failed to clear LED after diagnostic mic start failure");
                         }
-                        while (button_pressed()) {
+                        while (!s_dump_in_progress && button_pressed()) {
                             vTaskDelay(pdMS_TO_TICKS(10));
                         }
                         s_sensor_resume_tick = xTaskGetTickCount() + pdMS_TO_TICKS(SEND_INTERVAL_MS);
                     } else {
                         ESP_LOGI(TAG, "Diagnostic audio capture started");
 
-                        while (button_pressed() && total_samples < AUDIO_MAX_SAMPLES) {
+                        while (!s_dump_in_progress && button_pressed() && total_samples < AUDIO_MAX_SAMPLES) {
                             size_t remaining = AUDIO_MAX_SAMPLES - total_samples;
                             size_t to_read = remaining < MIC_READ_CHUNK ? remaining : MIC_READ_CHUNK;
                             size_t samples_read = 0;
@@ -1477,7 +1693,7 @@ static void button_task(void *pvParameters)
                         if (led_manager_set(false) != ESP_OK) {
                             ESP_LOGW(TAG, "Failed to clear LED after diagnostic mic capture");
                         }
-                        while (button_pressed()) {
+                        while (!s_dump_in_progress && button_pressed()) {
                             vTaskDelay(pdMS_TO_TICKS(10));
                         }
                         /* If a session was registered, audio_active stays true
@@ -1510,6 +1726,12 @@ static void send_task(void *pvParameters)
 
     while (1)
     {
+        if (s_dump_in_progress) {
+            ESP_LOGI(TAG, "Send task stopping for sensor dump");
+            s_send_task_handle = NULL;
+            vTaskDelete(NULL);
+        }
+
         TickType_t now = xTaskGetTickCount();
         bool measurement_due = now >= next_measurement_tick;
         TickType_t resume_tick = s_sensor_resume_tick;
@@ -1582,6 +1804,8 @@ void app_main(void)
 {
     bool diagnostic_mode = true;
     s_diagnostic_mode = diagnostic_mode;
+    s_boot_tick = xTaskGetTickCount();
+    s_audio_enable_tick = s_boot_tick + pdMS_TO_TICKS(AUDIO_BOOT_LOCKOUT_MS);
 
     ESP_ERROR_CHECK(led_manager_init(LED_GPIO, true));
     ESP_ERROR_CHECK(led_manager_set(false));
@@ -1626,6 +1850,18 @@ void app_main(void)
         }
         ESP_ERROR_CHECK(ret);
         ESP_ERROR_CHECK(init_persistent_queue());
+        s_offline_mode = button_held_at_boot();
+        if (s_offline_mode) {
+            portENTER_CRITICAL(&s_time_sync_mux);
+            s_sync_epoch_ms = 0;
+            s_sync_local_tick = s_boot_tick;
+            s_time_synced = true;
+            portEXIT_CRITICAL(&s_time_sync_mux);
+            ESP_LOGI(TAG, "Boot button held: OFFLINE-ALONE mode active");
+        } else {
+            ESP_ERROR_CHECK(clear_sensor_queue());
+            ESP_LOGI(TAG, "Boot button not held: ONLINE mode active");
+        }
         /* Session ID generator now self-initializes lazily on first
          * next_session_id() call so a flaky NVS write can't brick the boot. */
         /* Boot-time orphan-session recovery deferred to the monitor task —
@@ -1640,7 +1876,6 @@ void app_main(void)
             ESP_LOGE(TAG, "Diagnostic ESPNOW init failed: %s", esp_err_to_name(espnow_err));
             s_offline_mode = true;
         } else {
-            s_offline_mode = false;
             memcpy(base_station_mac, espnow_config.peer_mac, sizeof(base_station_mac));
             esp_err_t recv_cb_err = espnow_manager_register_recv_cb(handle_base_station_message, NULL);
             if (recv_cb_err != ESP_OK) {
@@ -1667,8 +1902,8 @@ void app_main(void)
         }
 
         ESP_LOGI(TAG, "Diagnostic mode: web monitor disabled, ESPNOW path active");
-        xTaskCreate(send_task, "send_task", 4096, NULL, 4, NULL);
-        xTaskCreate(audio_session_monitor_task, "audio_session_mon", 8192, NULL, 4, NULL);
+        xTaskCreate(send_task, "send_task", 4096, NULL, 4, &s_send_task_handle);
+        xTaskCreate(audio_session_monitor_task, "audio_session_mon", 8192, NULL, 4, &s_audio_monitor_task_handle);
     } else {
         const i2c_manager_config_t i2c_config = {
             .port = I2C_PORT_NUM,
@@ -1712,6 +1947,18 @@ void app_main(void)
         }
         ESP_ERROR_CHECK(ret);
         ESP_ERROR_CHECK(init_persistent_queue());
+        s_offline_mode = button_held_at_boot();
+        if (s_offline_mode) {
+            portENTER_CRITICAL(&s_time_sync_mux);
+            s_sync_epoch_ms = 0;
+            s_sync_local_tick = s_boot_tick;
+            s_time_synced = true;
+            portEXIT_CRITICAL(&s_time_sync_mux);
+            ESP_LOGI(TAG, "Boot button held: OFFLINE-ALONE mode active");
+        } else {
+            ESP_ERROR_CHECK(clear_sensor_queue());
+            ESP_LOGI(TAG, "Boot button not held: ONLINE mode active");
+        }
         /* Session ID generator now self-initializes lazily on first
          * next_session_id() call so a flaky NVS write can't brick the boot. */
         /* Boot-time orphan-session recovery deferred to the monitor task —
@@ -1740,29 +1987,15 @@ void app_main(void)
 
         ESP_LOGI(TAG, "WS2812/status LED feature disabled in firmware");
 
-        s_offline_mode = nvs_load_offline_flag();
-
-        if (button_held_at_boot()) {
-            ESP_LOGI(TAG, "Boot button held — probing basestation for up to 10s");
-            bool reachable = probe_basestation_for(10000);
-            s_offline_mode = !reachable;
-            nvs_store_offline_flag(s_offline_mode);
-            ESP_LOGI(TAG, "Boot decision: %s",
-                     s_offline_mode ? "OFFLINE (no basestation ack)" : "ONLINE (basestation reachable)");
-        } else {
-            ESP_LOGI(TAG, "Boot decision (button not held): %s",
-                     s_offline_mode ? "OFFLINE (resumed)" : "ONLINE");
-        }
-
         ESP_LOGI(TAG, "Queued at startup: %u audio chunk(s), %u sensor payload(s)",
                  (unsigned)count_queued_packets(QUEUE_KIND_AUDIO),
                  (unsigned)count_queued_packets(QUEUE_KIND_SENSOR));
 
-        xTaskCreate(send_task, "send_task", 4096, NULL, 4, NULL);
-        xTaskCreate(audio_session_monitor_task, "audio_session_mon", 8192, NULL, 4, NULL);
+        xTaskCreate(send_task, "send_task", 4096, NULL, 4, &s_send_task_handle);
+        xTaskCreate(audio_session_monitor_task, "audio_session_mon", 8192, NULL, 4, &s_audio_monitor_task_handle);
     }
 
-    xTaskCreate(button_task, "button_task", 8192, NULL, 5, NULL);
+    xTaskCreate(button_task, "button_task", 8192, NULL, 5, &s_button_task_handle);
 
     ESP_LOGI(TAG, "Diagnostic firmware ready");
 }

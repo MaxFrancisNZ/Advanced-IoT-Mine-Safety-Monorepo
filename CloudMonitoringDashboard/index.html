@@ -813,6 +813,11 @@
             return bTime - aTime;
         }
 
+        function localAlertRevision(doc, payload) {
+            const receivedMs = payload.received_at?.toDate?.()?.getTime?.() || 0;
+            return `${receivedMs}:${doc.id || ''}`;
+        }
+
         function pillFor(level) {
             if (level === 'warning') return 'pill-warning';
             if (level === 'danger' || level === 'error') return 'pill-danger';
@@ -1361,26 +1366,39 @@
 
         function computeAlertRows(sensorRows, warningDocs = []) {
             const alerts = [];
+            const latestSensorByNode = new Map();
             sensorRows.forEach(doc => {
                 const payload = doc.data();
-                const temp = payload.environment?.temperature;
                 const nodeId = payload.node_id || 'Unknown';
-                if (typeof temp === 'number') {
-                    if (temp > 80) {
-                        alerts.push({
-                            level: 'danger',
-                            message: `${displayLabelText(nodeId)} temperature above 80°C`,
-                            source: 'local',
-                            alertId: `temp:${nodeId}:danger`
-                        });
-                    } else if (temp > 35) {
-                        alerts.push({
-                            level: 'warning',
-                            message: `${displayLabelText(nodeId)} temperature high: ${temp.toFixed(1)}°C`,
-                            source: 'local',
-                            alertId: `temp:${nodeId}:warning`
-                        });
-                    }
+                const sortTime = payload.received_at?.toDate?.()?.getTime?.() || 0;
+                const current = latestSensorByNode.get(nodeId);
+                if (!current || sortTime > current.sortTime) {
+                    latestSensorByNode.set(nodeId, { doc, payload, sortTime });
+                }
+            });
+            latestSensorByNode.forEach(({ doc, payload, sortTime }, nodeId) => {
+                const temp = payload.environment?.temperature;
+                if (typeof temp !== 'number') return;
+                const alertId = `temp:${nodeId}`;
+                const revision = localAlertRevision(doc, payload);
+                if (temp > 80) {
+                    alerts.push({
+                        level: 'danger',
+                        message: `${displayLabelText(nodeId)} temperature above 80°C`,
+                        source: 'local',
+                        alertId,
+                        revision,
+                        sortTime
+                    });
+                } else if (temp > 35) {
+                    alerts.push({
+                        level: 'warning',
+                        message: `${displayLabelText(nodeId)} temperature high: ${temp.toFixed(1)}°C`,
+                        source: 'local',
+                        alertId,
+                        revision,
+                        sortTime
+                    });
                 }
             });
             warningDocs.slice(0, 5).forEach(doc => {
@@ -1402,16 +1420,17 @@
             return alerts;
         }
 
-        const hiddenLocalAlerts = new Set();
+        const hiddenLocalAlerts = new Map();
 
         function pruneHiddenLocalAlerts(alerts) {
-            const activeLocalIds = new Set(
+            const activeLocalAlerts = new Map(
                 alerts
                     .filter(alert => alert.source === 'local' && typeof alert.alertId === 'string')
-                    .map(alert => alert.alertId)
+                    .map(alert => [alert.alertId, alert.revision || ''])
             );
-            Array.from(hiddenLocalAlerts).forEach(alertId => {
-                if (!activeLocalIds.has(alertId)) {
+            Array.from(hiddenLocalAlerts.entries()).forEach(([alertId, hiddenRevision]) => {
+                const activeRevision = activeLocalAlerts.get(alertId);
+                if (activeRevision == null || activeRevision !== hiddenRevision) {
                     hiddenLocalAlerts.delete(alertId);
                 }
             });
@@ -1421,7 +1440,10 @@
             const banner = document.getElementById('alertBanner');
             const alerts = computeAlertRows(sensorRows, warningDocs);
             pruneHiddenLocalAlerts(alerts);
-            const visibleAlerts = alerts.filter(alert => !(alert.source === 'local' && hiddenLocalAlerts.has(alert.alertId)));
+            const visibleAlerts = alerts.filter(alert => {
+                if (alert.source !== 'local') return true;
+                return hiddenLocalAlerts.get(alert.alertId) !== (alert.revision || '');
+            });
             if (!visibleAlerts.length) {
                 banner.className = 'alert-banner empty';
                 banner.textContent = 'No active alerts. System normal.';
@@ -1438,7 +1460,7 @@
                 if (alert.source === 'audio' && alert.docId) {
                     clearBtn = `<button class="alert-row-clear" data-clear-type="audio" data-doc-id="${escapeHtml(alert.docId)}" title="Clear alert" aria-label="Clear alert">&times;</button>`;
                 } else if (alert.source === 'local' && alert.alertId) {
-                    clearBtn = `<button class="alert-row-clear" data-clear-type="local" data-alert-id="${escapeHtml(alert.alertId)}" title="Hide alert" aria-label="Hide alert">&times;</button>`;
+                    clearBtn = `<button class="alert-row-clear" data-clear-type="local" data-alert-id="${escapeHtml(alert.alertId)}" data-alert-revision="${escapeHtml(alert.revision || '')}" title="Hide alert" aria-label="Hide alert">&times;</button>`;
                 }
                 row.innerHTML = `<span class="alert-row-text"><span class="alert-row-level">${escapeHtml(alert.level)}</span>${escapeHtml(alert.message)}</span>${clearBtn}`;
                 banner.appendChild(row);
@@ -1451,15 +1473,15 @@
                         return;
                     }
                     if (clearType === 'local') {
-                        hideLocalAlert(btn.getAttribute('data-alert-id'));
+                        hideLocalAlert(btn.getAttribute('data-alert-id'), btn.getAttribute('data-alert-revision') || '');
                     }
                 });
             });
         }
 
-        function hideLocalAlert(alertId) {
+        function hideLocalAlert(alertId, revision = '') {
             if (!alertId) return;
-            hiddenLocalAlerts.add(alertId);
+            hiddenLocalAlerts.set(alertId, revision);
             renderAlertBanner(latestSensorRows, latestWarnings);
         }
 

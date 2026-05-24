@@ -15,6 +15,7 @@
 #define PROBE_MSG_TYPE        0x03
 #define AUDIO_NACK_MSG_TYPE   0x04   /* Pi -> wearable: retransmit missing chunks */
 #define AUDIO_ACK_MSG_TYPE    0x05   /* Pi -> wearable: session received in full   */
+#define DUMP_REQUEST_MSG_TYPE 0x06   /* Pi -> wearable: dump queued offline sensor data */
 
 #define ESPNOW_MAX_PAYLOAD    1470   /* ESP-NOW v2.0 max (ESP_NOW_MAX_DATA_LEN_V2) */
 #define AUDIO_CHUNK_HDR_SIZE  23     /* sizeof(audio_chunk_header_t) */

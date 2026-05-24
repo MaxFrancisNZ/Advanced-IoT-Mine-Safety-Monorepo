@@ -43,10 +43,8 @@ static void wifi_init_sta(uint8_t channel)
         ESP_ERROR_CHECK(err);
     }
 
-    if (mode == WIFI_MODE_NULL) {
+    if (mode != WIFI_MODE_STA) {
         ESP_ERROR_CHECK(esp_wifi_set_mode(WIFI_MODE_STA));
-    } else if (mode == WIFI_MODE_AP) {
-        ESP_ERROR_CHECK(esp_wifi_set_mode(WIFI_MODE_APSTA));
     }
 
     err = esp_wifi_start();

@@ -1,0 +1,9 @@
+{
+  "permissions": {
+    "allow": [
+      "Bash(python -m py_compile \"c:/Users/Josh/Desktop/uni proj iot/Advanced-IoT-Mine-Safety-Monorepo/PiBasestation/uart_sensor_dump.py\")",
+      "Bash(ls \"c:/Users/Josh/Desktop/uni proj iot/Advanced-IoT-Mine-Safety-Monorepo/\")",
+      "Read(//c/Users/Josh/Desktop/uni proj iot/Advanced-IoT-Mine-Safety-Monorepo/**)"
+    ]
+  }
+}
